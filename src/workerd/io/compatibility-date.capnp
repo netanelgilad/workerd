@@ -1540,4 +1540,12 @@ struct CompatibilityFlags @0x8f8c1b68151b6cef {
   # startup. This allows packages to extend `sys.path` declaratively (e.g. to
   # add subdirectories or register import hooks). Without this flag, `.pth`
   # files in `python_modules/` are ignored.
+
+  workflowsBindingsRpc @177 :Bool
+    $compatEnableFlag("workflows_bindings_rpc")
+    $experimental;
+  # When enabled, the `env.WORKFLOW` binding (cloudflare-internal:workflows-api)
+  # dispatches its methods as JSRPC calls on the inner fetcher instead of HTTP
+  # requests against the binding-shim worker. Without the flag the legacy HTTP
+  # transport is used.
 }
