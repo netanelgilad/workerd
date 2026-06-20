@@ -792,7 +792,28 @@ class IoContext final: public kj::Refcounted, private kj::TaskSet::ErrorHandler 
     KJ_IF_SOME(scope, tmpDirStoreScope) {
       return *scope;
     }
+    // FORK-ONLY (shared-tmp-vfs): if a shared /tmp directory was injected (e.g. by the Worker
+    // Loader for a dynamic isolate that opted in to inheriting the parent's filesystem), build the
+    // scope so that it wraps that shared directory instead of allocating a private one. This makes
+    // /tmp writes visible across the parent and child isolates. SAME-THREAD ONLY -- see
+    // setSharedTmpDir() below and the note on TmpDirStoreScope::create(kj::Rc<Directory>).
+    KJ_IF_SOME(shared, sharedTmpDir) {
+      return *tmpDirStoreScope.emplace(TmpDirStoreScope::create(shared.addRef()));
+    }
     return *tmpDirStoreScope.emplace(TmpDirStoreScope::create());
+  }
+
+  // FORK-ONLY (shared-tmp-vfs): inject a writable /tmp directory to be shared with another isolate
+  // (typically the parent that loaded this one via the Worker Loader). Must be called before the
+  // /tmp scope is first materialized (i.e. before any /tmp access in this request), otherwise the
+  // already-created private scope is kept. By taking the kj::Rc by value the directory outlives the
+  // donor IoContext even if the donor is torn down first.
+  //
+  // THREAD-SAFETY: the underlying in-memory directory is NOT thread-safe; only call this with a
+  // directory that will only ever be touched from THIS thread. Safe in OSS workerd because loaded
+  // isolates run on the same thread as their parent.
+  void setSharedTmpDir(kj::Rc<Directory> dir) {
+    sharedTmpDir = kj::mv(dir);
   }
 
   // Returns a promise that resolves once `now() >= when`.
@@ -1055,6 +1076,12 @@ class IoContext final: public kj::Refcounted, private kj::TaskSet::ErrorHandler 
   kj::Own<WeakRef> selfRef = kj::refcounted<WeakRef>(kj::Badge<IoContext>(), *this);
 
   kj::Maybe<kj::Own<TmpDirStoreScope>> tmpDirStoreScope;
+
+  // FORK-ONLY (shared-tmp-vfs): when set, getTmpDirStoreScope() builds the /tmp scope around this
+  // shared directory rather than a private one, letting this isolate share /tmp with whoever
+  // donated the directory (the parent isolate that loaded it). kj::none = default isolated /tmp.
+  // SAME-THREAD ONLY. See setSharedTmpDir().
+  kj::Maybe<kj::Rc<Directory>> sharedTmpDir;
 
   kj::Own<const Worker> worker;
   kj::Maybe<Worker::Actor&> actor;

@@ -1307,6 +1307,16 @@ TmpDirStoreScope::TmpDirStoreScope(kj::Maybe<kj::Badge<TmpDirStoreScope>> guard)
   }
 }
 
+// FORK-ONLY (shared-tmp-vfs): adopt an existing shared directory instead of allocating a fresh one.
+// Always heap-allocated (badge ctor) so it is never registered as the thread-local current scope;
+// the directory it wraps may be aliased by another (parent) scope on the SAME thread. See the
+// thread-safety note on TmpDirStoreScope::create(kj::Rc<Directory>) in worker-fs.h.
+TmpDirStoreScope::TmpDirStoreScope(kj::Badge<TmpDirStoreScope> guard, kj::Rc<Directory> shared)
+    : dir(kj::mv(shared)),
+      // we use the /bundle cwd for the isolate vfs
+      // and the /tmp cwd for the iocontext vfs
+      cwd({"bundle"}) {}
+
 TmpDirStoreScope::~TmpDirStoreScope() noexcept(false) {
   if (onStack) {
     KJ_ASSERT(tmpDirStorageScope == this, "this TmpDirStoreScope not on the stack");
@@ -1318,6 +1328,13 @@ kj::Own<TmpDirStoreScope> TmpDirStoreScope::create() {
   // Creating the instance with the badge will ensure that
   // it is not set as current in the stack.
   return kj::heap<TmpDirStoreScope>(kj::Badge<TmpDirStoreScope>());
+}
+
+kj::Own<TmpDirStoreScope> TmpDirStoreScope::create(kj::Rc<Directory> shared) {
+  // FORK-ONLY (shared-tmp-vfs): wrap the caller's shared directory. The resulting scope delegates
+  // all /tmp reads/writes into `shared`, so two isolates whose scopes share the same kj::Rc see one
+  // writable /tmp. Same-thread only (see worker-fs.h).
+  return kj::heap<TmpDirStoreScope>(kj::Badge<TmpDirStoreScope>(), kj::mv(shared));
 }
 
 Stat SymbolicLink::stat(jsg::Lock& js) {

@@ -751,10 +751,24 @@ class TmpDirStoreScope final {
   static bool hasCurrent();
   static TmpDirStoreScope& current();
   TmpDirStoreScope(kj::Maybe<kj::Badge<TmpDirStoreScope>> guard = kj::none);
+  // FORK-ONLY (shared-tmp-vfs): badge ctor that adopts an existing shared directory rather than
+  // allocating its own. Only reachable via the create(kj::Rc<Directory>) factory below.
+  TmpDirStoreScope(kj::Badge<TmpDirStoreScope> guard, kj::Rc<Directory> shared);
   KJ_DISALLOW_COPY_AND_MOVE(TmpDirStoreScope);
   ~TmpDirStoreScope() noexcept(false);
 
   static kj::Own<TmpDirStoreScope> create();
+
+  // FORK-ONLY (shared-tmp-vfs): Create a heap TmpDirStoreScope that WRAPS an existing, shared
+  // writable directory instead of allocating a fresh one via Directory::newWritable(). This is how
+  // a Worker-Loader-spawned (dynamic) isolate can share one writable /tmp with its parent.
+  //
+  // THREAD-SAFETY: the in-memory directory implementation (WritableDirectory, a plain kj::HashMap
+  // behind a non-atomic kj::Rc) is NOT thread-safe. Sharing a directory between two scopes is only
+  // safe when both scopes are accessed from the SAME thread. In OSS workerd a loaded isolate runs
+  // on the same thread as its parent ("we are single-threaded here" in server.c++), so this holds.
+  // Do NOT use this overload to share a directory across threads.
+  static kj::Own<TmpDirStoreScope> create(kj::Rc<Directory> shared);
 
   kj::Rc<Directory> getDirectory() const {
     return dir.addRef();
