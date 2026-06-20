@@ -64,7 +64,10 @@ class WorkerEntrypoint final: public WorkerInterface {
       kj::Maybe<tracing::InvocationSpanContext> maybeTriggerInvocationSpan,
       bool isDynamicDispatch,
       kj::Maybe<kj::Own<AccessInfo>> accessInfo,
-      kj::Maybe<kj::Own<IoChannelFactory::SelfTokenFactory>> selfTokenFactory);
+      kj::Maybe<kj::Own<IoChannelFactory::SelfTokenFactory>> selfTokenFactory,
+      // FORK-ONLY (shared-tmp-vfs): optional parent-donated writable /tmp for an opt-in dynamic
+      // worker. kj::none = isolated /tmp (default). SAME-THREAD ONLY.
+      kj::Maybe<kj::Rc<Directory>> sharedTmpDir = kj::none);
 
   kj::Promise<void> request(kj::HttpMethod method,
       kj::StringPtr url,
@@ -116,7 +119,10 @@ class WorkerEntrypoint final: public WorkerInterface {
       kj::Maybe<kj::Own<BaseTracer>> workerTracer,
       kj::Maybe<tracing::InvocationSpanContext> maybeTriggerInvocationSpan,
       kj::Maybe<kj::Own<AccessInfo>> accessInfo,
-      kj::Maybe<kj::Own<IoChannelFactory::SelfTokenFactory>> selfTokenFactory);
+      kj::Maybe<kj::Own<IoChannelFactory::SelfTokenFactory>> selfTokenFactory,
+      // FORK-ONLY (shared-tmp-vfs): optional parent-donated writable /tmp for an opt-in dynamic
+      // worker. kj::none = isolated /tmp (default). SAME-THREAD ONLY.
+      kj::Maybe<kj::Rc<Directory>> sharedTmpDir = kj::none);
 
   kj::Promise<void> requestImpl(kj::HttpMethod method,
       kj::StringPtr url,
