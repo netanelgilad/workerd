@@ -637,6 +637,47 @@ export const writevAsyncCallbackTest = {
   },
 };
 
+// Regression test for Bug A: fs.writev(fd, buffers, undefined, cb) must invoke
+// the callback. Previously an explicit `undefined` position made
+// validatePosition() throw synchronously, so the callback was never scheduled
+// and the write silently hung. The 3-arg form, position 0, and position null
+// always worked; only literal `undefined` dropped the callback. This is exactly
+// what @isaacs/fs-minipass (used by tar) passes for every multi-chunk file:
+//   writev(fd, iovec, this[_pos] /* undefined */, cb)
+export const writevUndefinedPositionCallbackTest = {
+  async test() {
+    const fd = openSync('/tmp/writev-undef.txt', 'w+');
+
+    // The exact repro from the bug report: position === undefined.
+    const written = await new Promise((resolve, reject) => {
+      writev(
+        fd,
+        [Buffer.from('ab'), Buffer.from('cd')],
+        undefined,
+        (err, bw) => {
+          if (err) return reject(err);
+          resolve(bw);
+        }
+      );
+    });
+    strictEqual(written, 4);
+
+    // undefined position writes at the current position, like null. A second
+    // call should append rather than overwrite.
+    const written2 = await new Promise((resolve, reject) => {
+      writev(fd, [Buffer.from('ef')], undefined, (err, bw) => {
+        if (err) return reject(err);
+        resolve(bw);
+      });
+    });
+    strictEqual(written2, 2);
+
+    closeSync(fd);
+    strictEqual(readFileSync('/tmp/writev-undef.txt').toString(), 'abcdef');
+    unlinkSync('/tmp/writev-undef.txt');
+  },
+};
+
 export const writeFileSyncTest = {
   test() {
     ok(!existsSync('/tmp/test.txt'));
