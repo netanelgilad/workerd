@@ -4778,9 +4778,29 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
           };
         },
 
-        .compileBindings = [env = kj::mv(source.env)](
+        .compileBindings = [env = kj::mv(source.env),
+                               vfsModuleFallback = source.vfsModuleFallback](
             jsg::Lock& js, const Worker::Api& api, v8::Local<v8::Object> target) mutable {
           env.populateJsObject(js, jsg::JsObject(target));
+          // FORK-ONLY (vfs-module-loading): a child that resolves+RUNS npm packages from the
+          // shared /tmp needs UnsafeEval -- real bundlers (vite/rolldown/esbuild-wasm) compile
+          // WebAssembly and generate code (eval / new Function) at runtime, which workerd forbids
+          // outside the UnsafeEval binding. UnsafeEval is a native jsg type and is therefore NOT
+          // RPC-serializable, so it cannot be passed through the child's `env` from the parent.
+          // Instead we inject it directly here as an implicit `UNSAFE_EVAL` binding on the child's
+          // env object. This is gated on the same opt-in as the VFS module loader (a fork-only,
+          // experimental, trusted-self-hosting feature), so it does not widen the attack surface
+          // of any worker that hasn't already opted into running arbitrary /tmp code.
+          if (vfsModuleFallback) {
+            auto globals = kj::heapArrayBuilder<WorkerdApi::Global>(1);
+            globals.add(WorkerdApi::Global{
+              .name = kj::str("UNSAFE_EVAL"),
+              .value = WorkerdApi::Global::UnsafeEval{},
+            });
+            auto globalsArr = globals.finish();
+            kj::downcast<const WorkerdApi>(api).compileGlobals(
+                js, globalsArr, target, /* ownerId = */ 0);
+          }
         },
 
         // Note here that we always keep the ownContent from the source, even if
@@ -5215,6 +5235,15 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
           "vfsModuleFallback requires shareParentTmp:true so the child can resolve modules from "
           "the parent's shared /tmp.");
       auto tmpDir = KJ_ASSERT_NONNULL(def.sharedTmpDir).addRef();
+      // FORK-ONLY (vfs-module-loading): install the shared /tmp as the thread-local module-eval
+      // fallback directory. Dynamically-imported npm modules in this child are evaluated by V8 with
+      // NO IoContext on the stack (global scope), so their module-eval-time `fs.readFileSync(...)`
+      // calls cannot reach the request IoContext's shared /tmp. This persistent thread-local lets
+      // node:fs find the shared /tmp during that evaluation. Safe: the parent DO always has an
+      // IoContext during its own fs access (which takes precedence), and shareParentTmp guarantees
+      // this is the very same directory the parent uses, so the fallback can never expose a foreign
+      // filesystem. The child isolate is dedicated and runs on the parent's thread.
+      workerd::setVfsModuleEvalFallbackDir(tmpDir.addRef());
       auto& apiIsolate = isolate->getApi();
       apiIsolate.setModuleFallbackCallback(
           [featureFlags = apiIsolate.getFeatureFlags(), tmpDir = kj::mv(tmpDir)](jsg::Lock& js,

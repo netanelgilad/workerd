@@ -54,6 +54,19 @@ thread_local SymbolicLinkRecursionGuardScope* symbolicLinkGuard = nullptr;
 // on the stack.
 static thread_local TmpDirStoreScope* tmpDirStorageScope = nullptr;
 
+// FORK-ONLY (vfs-module-loading): a thread-local fallback /tmp directory consulted by
+// tryGetDirectory() as a LAST RESORT -- only when there is neither an active IoContext nor a
+// stack TmpDirStoreScope. This exists to make the shared /tmp visible during the GLOBAL-SCOPE
+// evaluation of dynamically-imported modules in a Worker-Loader child that opted into
+// vfsModuleFallback: workerd evaluates such modules with no IoContext on the stack ("Disallowed
+// operation ... within global scope"), so npm packages doing `fs.readFileSync(...)` at module-eval
+// time would otherwise see an empty /tmp. The VFS child captures the parent DO's shared /tmp at
+// isolate setup and installs it here for the lifetime of the isolate. Same-thread only: the child
+// runs on the parent's thread and the underlying in-memory directory is not thread-safe. The
+// parent's own fs always goes through its IoContext (checked first), so this fallback never
+// shadows it.
+static thread_local kj::Maybe<kj::Rc<Directory>> vfsModuleEvalFallbackDir = kj::none;
+
 // The TmpDirectory is a special directory implementation that uses the
 // current TmpDirStoreScope to actually store the directory contents. The
 // current TmpDirStoreScope can either be set on the stack or via the current
@@ -169,6 +182,15 @@ class TmpDirectory final: public Directory {
   kj::Maybe<kj::Rc<Directory>> tryGetDirectory() const {
     KJ_IF_SOME(ioContext, IoContext::tryCurrent()) {
       return ioContext.getTmpDirStoreScope().getDirectory();
+    }
+    // FORK-ONLY (vfs-module-loading): when a VFS child has installed a module-eval fallback /tmp and
+    // there is NO active IoContext, prefer that shared directory over any stack TmpDirStoreScope.
+    // The stack scope reachable here during a dynamically-imported module's global-scope evaluation
+    // is the child's PRIVATE bootstrap scope (an empty /tmp), so honoring it would defeat the whole
+    // point -- npm packages read their data files from the shared /tmp at module-eval time. The
+    // parent DO is unaffected because it always runs its fs access with an IoContext (handled above).
+    KJ_IF_SOME(shared, vfsModuleEvalFallbackDir) {
+      return shared.addRef();
     }
     if (TmpDirStoreScope::hasCurrent()) {
       return TmpDirStoreScope::current().getDirectory();
@@ -1335,6 +1357,20 @@ kj::Own<TmpDirStoreScope> TmpDirStoreScope::create(kj::Rc<Directory> shared) {
   // all /tmp reads/writes into `shared`, so two isolates whose scopes share the same kj::Rc see one
   // writable /tmp. Same-thread only (see worker-fs.h).
   return kj::heap<TmpDirStoreScope>(kj::Badge<TmpDirStoreScope>(), kj::mv(shared));
+}
+
+// FORK-ONLY (vfs-module-loading): install/restore the thread-local module-eval fallback /tmp dir.
+VfsModuleEvalFallbackDirScope::VfsModuleEvalFallbackDirScope(kj::Rc<Directory> dir)
+    : previous(kj::mv(vfsModuleEvalFallbackDir)) {
+  vfsModuleEvalFallbackDir = kj::mv(dir);
+}
+
+VfsModuleEvalFallbackDirScope::~VfsModuleEvalFallbackDirScope() noexcept(false) {
+  vfsModuleEvalFallbackDir = kj::mv(previous);
+}
+
+void setVfsModuleEvalFallbackDir(kj::Maybe<kj::Rc<Directory>> dir) {
+  vfsModuleEvalFallbackDir = kj::mv(dir);
 }
 
 Stat SymbolicLink::stat(jsg::Lock& js) {

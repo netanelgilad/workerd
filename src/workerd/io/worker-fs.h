@@ -788,6 +788,34 @@ class TmpDirStoreScope final {
   bool onStack = false;
 };
 
+// FORK-ONLY (vfs-module-loading): RAII scope that installs a thread-local fallback /tmp directory
+// consulted by the in-memory filesystem ONLY when there is no active IoContext and no stack
+// TmpDirStoreScope. This is the mechanism that lets a Worker-Loader child (opted into
+// vfsModuleFallback + shareParentTmp) read the shared /tmp during the GLOBAL-SCOPE evaluation of
+// dynamically-imported npm modules -- workerd evaluates those with no IoContext, so package code
+// doing `fs.readFileSync(...)` at module-eval time would otherwise see an empty /tmp.
+//
+// SAME-THREAD ONLY: the wrapped in-memory directory is not thread-safe; the child runs on the
+// parent's thread. The parent's own fs always resolves through its IoContext (checked first), so
+// this fallback can never shadow it. Nesting is supported (the previous value is restored on
+// destruction) but the common case is a single isolate-lifetime scope.
+class VfsModuleEvalFallbackDirScope final {
+ public:
+  explicit VfsModuleEvalFallbackDirScope(kj::Rc<Directory> dir);
+  ~VfsModuleEvalFallbackDirScope() noexcept(false);
+  KJ_DISALLOW_COPY_AND_MOVE(VfsModuleEvalFallbackDirScope);
+
+ private:
+  kj::Maybe<kj::Rc<Directory>> previous;
+};
+
+// FORK-ONLY (vfs-module-loading): set the thread-local module-eval fallback /tmp directory for the
+// LIFETIME of the current thread (no RAII unwind). Used at VFS-child isolate setup: the child is a
+// dedicated isolate running on the parent's thread, and module-eval-time fs reads happen with no
+// IoContext on the stack, so a persistent thread-local is the only place node:fs can find the
+// shared /tmp at that point. Passing kj::none clears it. See tryGetDirectory() in worker-fs.c++.
+void setVfsModuleEvalFallbackDir(kj::Maybe<kj::Rc<Directory>> dir);
+
 // A scope utility that is used to guard against infinite recursion when
 // resolving symbolic links. This should only ever be stack allocated and
 // should never be shared outside of the current execution scope.
