@@ -678,6 +678,72 @@ export const writevUndefinedPositionCallbackTest = {
   },
 };
 
+// Regression test for Bug B (tar Unpack pipeline hang). tar writes many files
+// via @isaacs/fs-minipass WriteStream, which uses fs.write for single-chunk
+// files and fs.writev(fd, iovec, this[_pos], cb) for multi-chunk files. For a
+// non-`start` WriteStream this[_pos] is `undefined`, so every multi-chunk file
+// hit Bug A: writev(fd, buffers, undefined, cb) threw synchronously and the
+// completion callback was dropped. tar's pending-file counter then never
+// reached 0 and extraction hung after the first (single-chunk) file. Bug B is
+// therefore a pure manifestation of Bug A, not a separate scheduling/in-flight
+// bug. This test reproduces the composed shape: a concurrent burst of
+// multi-chunk writev + single-chunk 6-arg write (both with undefined position),
+// each followed by close, and asserts every callback fires and every byte
+// lands. Before the Bug A fix, the multi-chunk callbacks never fire and the
+// Promise.all below never resolves (the original hang).
+export const concurrentWritevWriteCloseTest = {
+  async test() {
+    const fileCount = 8;
+    const tasks = [];
+
+    for (let i = 0; i < fileCount; i++) {
+      const path = `/tmp/concurrent-${i}.txt`;
+      const multiChunk = i % 2 === 0;
+      tasks.push(
+        new Promise((resolve, reject) => {
+          const fd = openSync(path, 'w');
+          const onDone = (err, bw) => {
+            if (err) return reject(err);
+            // close must also invoke its callback (fs.close with a cb).
+            close(fd, (closeErr) => {
+              if (closeErr) return reject(closeErr);
+              resolve({ path, bw, multiChunk });
+            });
+          };
+          if (multiChunk) {
+            // Mirrors fs-minipass WriteStream[_flush]: undefined position.
+            writev(
+              fd,
+              [Buffer.from(`file${i}-`), Buffer.from('multi')],
+              undefined,
+              onDone
+            );
+          } else {
+            // Mirrors fs-minipass WriteStream[_write]: 6-arg write with an
+            // undefined position.
+            const buf = Buffer.from(`file${i}-single`);
+            write(fd, buf, 0, buf.length, undefined, onDone);
+          }
+        })
+      );
+    }
+
+    // If any callback is dropped, this Promise.all never resolves and the test
+    // times out (the original failure mode).
+    const results = await Promise.all(tasks);
+    strictEqual(results.length, fileCount);
+
+    for (let i = 0; i < fileCount; i++) {
+      const expected = i % 2 === 0 ? `file${i}-multi` : `file${i}-single`;
+      strictEqual(
+        readFileSync(`/tmp/concurrent-${i}.txt`).toString(),
+        expected
+      );
+      unlinkSync(`/tmp/concurrent-${i}.txt`);
+    }
+  },
+};
+
 export const writeFileSyncTest = {
   test() {
     ok(!existsSync('/tmp/test.txt'));
