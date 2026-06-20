@@ -16,6 +16,7 @@ class RequestObserver;
 class ThreadContext;
 class WorkerInterface;
 class BaseTracer;
+class Directory;  // FORK-ONLY (shared-tmp-vfs): for the optional shared /tmp directory below.
 
 namespace tracing {
 class InvocationSpanContext;
@@ -52,6 +53,11 @@ kj::Own<WorkerInterface> newWorkerEntrypoint(ThreadContext& threadContext,
     // Per-request Cloudflare Access info. Supplied by the embedding application; standalone
     // workerd passes kj::none, which causes `ctx.access` to be `undefined` in JS.
     kj::Maybe<kj::Own<AccessInfo>> accessInfo = kj::none,
-    kj::Maybe<kj::Own<IoChannelFactory::SelfTokenFactory>> selfTokenFactory = kj::none);
+    kj::Maybe<kj::Own<IoChannelFactory::SelfTokenFactory>> selfTokenFactory = kj::none,
+    // FORK-ONLY (shared-tmp-vfs): if set, this request's IoContext will SHARE this writable /tmp
+    // directory (donated by the parent worker that loaded this dynamic isolate) instead of getting
+    // a private one. kj::none = isolated /tmp (default). SAME-THREAD ONLY -- the directory is not
+    // thread-safe; only used for same-thread dynamic workers.
+    kj::Maybe<kj::Rc<Directory>> sharedTmpDir = kj::none);
 
 }  // namespace workerd

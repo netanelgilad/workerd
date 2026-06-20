@@ -3117,7 +3117,10 @@ class Server::WorkerService final: public Service,
       kj::Maybe<kj::String> dockerPathParam,
       kj::Maybe<kj::String> containerEgressInterceptorImageParam,
       bool isDynamic,
-      kj::Maybe<kj::Function<void()>> abortIsolateCallback = kj::none)
+      kj::Maybe<kj::Function<void()>> abortIsolateCallback = kj::none,
+      // FORK-ONLY (shared-tmp-vfs): parent's /tmp dir to share with this (dynamic) worker's
+      // requests, or kj::none for isolated /tmp. SAME-THREAD ONLY.
+      kj::Maybe<kj::Rc<workerd::Directory>> sharedTmpDir = kj::none)
       : channelTokenHandler(channelTokenHandler),
         serviceName(serviceName),
         threadContext(threadContext),
@@ -3133,7 +3136,8 @@ class Server::WorkerService final: public Service,
         dockerPath(kj::mv(dockerPathParam)),
         containerEgressInterceptorImage(kj::mv(containerEgressInterceptorImageParam)),
         isDynamic(isDynamic),
-        abortIsolateCallback(kj::mv(abortIsolateCallback)) {}
+        abortIsolateCallback(kj::mv(abortIsolateCallback)),
+        sharedTmpDir(kj::mv(sharedTmpDir)) {}
 
   // Call immediately after the constructor to set up `actorNamespaces`. This can't happen during
   // the constructor itself since it sets up cyclic references, which will throw an exception if
@@ -3439,6 +3443,12 @@ class Server::WorkerService final: public Service,
       }
     }
 
+    // FORK-ONLY (shared-tmp-vfs): for opt-in dynamic workers, pass the parent's shared /tmp dir so
+    // this request's IoContext shares it. addRef so the WorkerService keeps owning the directory
+    // across multiple requests. kj::none (the common case) preserves upstream isolated /tmp.
+    kj::Maybe<kj::Rc<workerd::Directory>> requestSharedTmpDir =
+        sharedTmpDir.map([](kj::Rc<workerd::Directory>& d) { return d.addRef(); });
+
     return newWorkerEntrypoint(threadContext, kj::atomicAddRef(*worker), entrypointName,
         kj::mv(props), kj::mv(actor),
         kj::attachRef(static_cast<LimitEnforcer&>(*this), kj::addRef(*this)),
@@ -3452,7 +3462,8 @@ class Server::WorkerService final: public Service,
         kj::mv(triggerContext),
         false,     // isDynamicDispatch
         kj::none,  // accessInfo
-        kj::mv(metadata.restoredSelfTokenFactory));
+        kj::mv(metadata.restoredSelfTokenFactory),
+        kj::mv(requestSharedTmpDir));
   }
 
  private:
@@ -3653,6 +3664,12 @@ class Server::WorkerService final: public Service,
   kj::Maybe<kj::String> containerEgressInterceptorImage;
   bool isDynamic;
   kj::Maybe<kj::Function<void()>> abortIsolateCallback;
+
+  // FORK-ONLY (shared-tmp-vfs): if set, the parent worker's writable /tmp directory that this
+  // (dynamic) worker shares. Injected into each child request's IoContext in startRequest().
+  // Held here (parent thread, lives as long as the WorkerService / WorkerStubImpl) so the directory
+  // outlives any individual child request. SAME-THREAD ONLY -- not thread-safe.
+  kj::Maybe<kj::Rc<workerd::Directory>> sharedTmpDir;
 
   // ---------------------------------------------------------------------------
   // implements kj::TaskSet::ErrorHandler
@@ -4508,6 +4525,11 @@ struct Server::WorkerDef {
   // source contains a clone of the source bundle, this will take ownership.
   kj::Maybe<kj::Own<void>> maybeOwnedSourceCode;
 
+  // FORK-ONLY (shared-tmp-vfs): for opt-in dynamic workers, the parent's writable /tmp directory
+  // to share with this isolate. kj::none for normal/isolated /tmp. Stored on the resulting
+  // WorkerService and injected into each child IoContext at request start. SAME-THREAD ONLY.
+  kj::Maybe<kj::Rc<workerd::Directory>> sharedTmpDir;
+
   // Callback invoked when abortIsolate() is called. Used by dynamic workers to remove
   // themselves from the loader's isolate map.
   kj::Maybe<kj::Function<void()>> abortIsolateCallback;
@@ -4762,6 +4784,9 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
         // ownership issues. For the downstream use, however, we need to be careful
         // to not copy the ownContent if it is an RPC response.
         .maybeOwnedSourceCode = kj::mv(source.ownContent),
+        // FORK-ONLY (shared-tmp-vfs): carry the parent's shared /tmp dir (if the caller opted in)
+        // into the WorkerService so each child request's IoContext can share it. SAME-THREAD ONLY.
+        .sharedTmpDir = kj::mv(source.sharedTmpDir),
         // The callback is owned by the WorkerService, which is owned by `this`, so a raw
         // pointer is safe.
         .abortIsolateCallback = kj::Function<void()>([this]() { onAbortIsolate(); }),
@@ -5429,7 +5454,9 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
           kj::mv(errorReporter.namedEntrypoints), kj::mv(errorReporter.actorClasses),
           kj::mv(linkCallback), KJ_BIND_METHOD(*this, abortAllActors),
           KJ_BIND_METHOD(*this, deleteAllActors), kj::mv(dockerPath),
-          kj::mv(containerEgressInterceptorImage), def.isDynamic, kj::mv(abortIsolateCallback));
+          kj::mv(containerEgressInterceptorImage), def.isDynamic, kj::mv(abortIsolateCallback),
+          // FORK-ONLY (shared-tmp-vfs): forward the opt-in shared /tmp dir to the service.
+          kj::mv(def.sharedTmpDir));
   result->initActorNamespaces(def.localActorConfigs, actorNamespacesByUniqueKey, network);
   co_return result;
 }

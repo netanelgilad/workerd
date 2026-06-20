@@ -9,6 +9,7 @@
 #include <workerd/io/frankenvalue.h>
 #include <workerd/io/io-util.h>
 #include <workerd/io/trace.h>
+#include <workerd/io/worker-fs.h>  // FORK-ONLY (shared-tmp-vfs): for kj::Rc<Directory>
 #include <workerd/io/worker-interface.capnp.h>
 #include <workerd/io/worker-source.h>
 
@@ -492,6 +493,13 @@ struct DynamicWorkerSource {
   kj::Array<kj::Own<IoChannelFactory::SubrequestChannel>> tails;
   kj::Array<kj::Own<IoChannelFactory::SubrequestChannel>> streamingTails;
 
+  // FORK-ONLY (shared-tmp-vfs): when present, this is the parent worker's writable /tmp directory,
+  // captured at load time so the dynamic worker can SHARE it (opt-in via WorkerCode.shareParentTmp).
+  // kj::none = isolated /tmp (default/upstream behavior). The kj::Rc is held by value so the
+  // directory outlives the parent IoContext. SAME-THREAD ONLY -- the directory impl is not
+  // thread-safe and a loaded isolate runs on the parent's thread in workerd.
+  kj::Maybe<kj::Rc<Directory>> sharedTmpDir;
+
   // Owns any data structures pointed into by the other members. (E.g. `source` contains a lot of
   // `StringPtr`s; `ownContent` owns the backing buffer for them.)
   kj::Own<void> ownContent;
@@ -516,6 +524,9 @@ struct DynamicWorkerSource {
       .globalOutbound = mapAddRef(globalOutbound),
       .tails = KJ_MAP(t, tails) { return kj::addRef(*t); },
       .streamingTails = KJ_MAP(t, streamingTails) { return kj::addRef(*t); },
+      // FORK-ONLY (shared-tmp-vfs): share the SAME directory (addRef), not a copy, so re-loads of
+      // the isolate keep aliasing the parent's /tmp.
+      .sharedTmpDir = sharedTmpDir.map([](kj::Rc<Directory>& d) { return d.addRef(); }),
       .ownContent = kj::mv(newOwnContent),
       .ownContentIsRpcResponse = ownContentIsRpcResponse,
     };

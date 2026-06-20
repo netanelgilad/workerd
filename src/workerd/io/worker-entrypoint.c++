@@ -205,7 +205,8 @@ kj::Own<WorkerInterface> WorkerEntrypoint::construct(ThreadContext& threadContex
     kj::Maybe<tracing::InvocationSpanContext> maybeTriggerInvocationSpan,
     bool isDynamicDispatch,
     kj::Maybe<kj::Own<AccessInfo>> accessInfo,
-    kj::Maybe<kj::Own<IoChannelFactory::SelfTokenFactory>> selfTokenFactory) {
+    kj::Maybe<kj::Own<IoChannelFactory::SelfTokenFactory>> selfTokenFactory,
+    kj::Maybe<kj::Rc<Directory>> sharedTmpDir) {
   TRACE_EVENT("workerd", "WorkerEntrypoint::construct()");
 
   // Arrange to forcefully cancel work when the Actor is aborted.
@@ -219,7 +220,8 @@ kj::Own<WorkerInterface> WorkerEntrypoint::construct(ThreadContext& threadContex
       kj::mv(cfBlobJson), kj::mv(versionInfo));
   obj->init(kj::mv(worker), kj::mv(actor), kj::mv(limitEnforcer), kj::mv(ioContextDependency),
       kj::mv(ioChannelFactory), kj::addRef(*metrics), kj::mv(workerTracer),
-      kj::mv(maybeTriggerInvocationSpan), kj::mv(accessInfo), kj::mv(selfTokenFactory));
+      kj::mv(maybeTriggerInvocationSpan), kj::mv(accessInfo), kj::mv(selfTokenFactory),
+      kj::mv(sharedTmpDir));
   auto& wrapper = metrics->wrapWorkerInterface(*obj);
   return kj::attachRef(wrapper, kj::mv(obj), kj::mv(metrics));
 }
@@ -253,7 +255,8 @@ void WorkerEntrypoint::init(kj::Own<const Worker> worker,
     kj::Maybe<kj::Own<BaseTracer>> workerTracer,
     kj::Maybe<tracing::InvocationSpanContext> maybeTriggerInvocationSpan,
     kj::Maybe<kj::Own<AccessInfo>> accessInfo,
-    kj::Maybe<kj::Own<IoChannelFactory::SelfTokenFactory>> selfTokenFactory) {
+    kj::Maybe<kj::Own<IoChannelFactory::SelfTokenFactory>> selfTokenFactory,
+    kj::Maybe<kj::Rc<Directory>> sharedTmpDir) {
   TRACE_EVENT("workerd", "WorkerEntrypoint::init()");
   // We need to construct the IoContext -- unless this is an actor and it already has a
   // IoContext, in which case we reuse it.
@@ -266,8 +269,16 @@ void WorkerEntrypoint::init(kj::Own<const Worker> worker,
     // of the associated WorkerInterface, other references may be created below for actors requests
     // in separate init() calls but this ioContextDependency does not need to live as long as those
     // instances.
-    return kj::refcounted<IoContext>(threadContext, kj::mv(worker), actorRef, kj::mv(limitEnforcer))
-        .attachToThisReference(kj::mv(ioContextDependency));
+    auto ctx =
+        kj::refcounted<IoContext>(threadContext, kj::mv(worker), actorRef, kj::mv(limitEnforcer));
+    // FORK-ONLY (shared-tmp-vfs): if the embedder donated a /tmp directory (opt-in dynamic worker
+    // sharing its parent's /tmp), inject it before the IoContext's /tmp scope is materialized so
+    // this request sees the shared filesystem. SAME-THREAD ONLY -- the directory is not
+    // thread-safe and the loaded isolate runs on the parent's thread.
+    KJ_IF_SOME(dir, sharedTmpDir) {
+      ctx->setSharedTmpDir(kj::mv(dir));
+    }
+    return ctx.attachToThisReference(kj::mv(ioContextDependency));
   };
 
   kj::Own<IoContext> context;
@@ -1006,13 +1017,14 @@ kj::Own<WorkerInterface> newWorkerEntrypoint(ThreadContext& threadContext,
     kj::Maybe<tracing::InvocationSpanContext> maybeTriggerInvocationSpan,
     bool isDynamicDispatch,
     kj::Maybe<kj::Own<AccessInfo>> accessInfo,
-    kj::Maybe<kj::Own<IoChannelFactory::SelfTokenFactory>> selfTokenFactory) {
+    kj::Maybe<kj::Own<IoChannelFactory::SelfTokenFactory>> selfTokenFactory,
+    kj::Maybe<kj::Rc<Directory>> sharedTmpDir) {
   return WorkerEntrypoint::construct(threadContext, kj::mv(worker), kj::mv(entrypointName),
       kj::mv(props), kj::mv(actor), kj::mv(limitEnforcer), kj::mv(ioContextDependency),
       kj::mv(ioChannelFactory), kj::mv(metrics), waitUntilTasks, tunnelExceptions,
       kj::mv(workerTracer), kj::mv(cfBlobJson), kj::mv(versionInfo),
       kj::mv(maybeTriggerInvocationSpan), isDynamicDispatch, kj::mv(accessInfo),
-      kj::mv(selfTokenFactory));
+      kj::mv(selfTokenFactory), kj::mv(sharedTmpDir));
 }
 
 }  // namespace workerd

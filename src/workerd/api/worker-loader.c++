@@ -204,6 +204,16 @@ DynamicWorkerSource WorkerLoader::toDynamicWorkerSource(jsg::Lock& js,
     };
   }
 
+  // FORK-ONLY (shared-tmp-vfs): if the caller opted in, capture the PARENT worker's writable /tmp
+  // directory now, while the parent IoContext is live, and pass it to the child so they share one
+  // /tmp. We grab the kj::Rc by value so the directory survives even if the parent IoContext is
+  // destroyed before the child finishes. SAME-THREAD ONLY -- safe because the loaded isolate runs
+  // on the parent's thread in workerd; the in-memory directory is not thread-safe.
+  kj::Maybe<kj::Rc<Directory>> sharedTmpDir;
+  if (code.shareParentTmp.orDefault(false)) {
+    sharedTmpDir = ioctx.getTmpDirStoreScope().getDirectory();
+  }
+
   return {.source = kj::mv(extractedSource),
     .compatibilityFlags = compatFlags,
     .limits = code.limits,
@@ -211,6 +221,7 @@ DynamicWorkerSource WorkerLoader::toDynamicWorkerSource(jsg::Lock& js,
     .globalOutbound = kj::mv(globalOutbound),
     .tails = kj::mv(tailChannels),
     .streamingTails = kj::mv(streamingTailChannels),
+    .sharedTmpDir = kj::mv(sharedTmpDir),
     .ownContent = ownCompatFlags.attach(kj::mv(code.modules), kj::mv(code.mainModule)),
     .ownContentIsRpcResponse = false};
 }

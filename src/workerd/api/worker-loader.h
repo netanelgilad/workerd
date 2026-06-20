@@ -105,6 +105,14 @@ class WorkerLoader: public jsg::Object {
     jsg::Optional<kj::Array<jsg::Ref<Fetcher>>> tails;
     jsg::Optional<kj::Array<jsg::Ref<Fetcher>>> streamingTails;
 
+    // FORK-ONLY (shared-tmp-vfs): OPT-IN. When true, this dynamically-loaded worker SHARES the
+    // calling (parent) worker's writable /tmp virtual filesystem instead of getting its own
+    // private one. This deliberately relaxes the per-isolate filesystem isolation and is intended
+    // for trusted self-hosted deployments only. Defaults to false (isolated /tmp, upstream
+    // behavior). SAME-THREAD ONLY -- the shared in-memory directory is not thread-safe; this is
+    // safe in workerd because loaded isolates run on the parent's thread.
+    jsg::Optional<bool> shareParentTmp = false;
+
     // TODO(someday): cache API outbound?
 
     JSG_STRUCT(compatibilityDate,
@@ -116,7 +124,8 @@ class WorkerLoader: public jsg::Object {
         env,
         globalOutbound,
         tails,
-        streamingTails);
+        streamingTails,
+        shareParentTmp);
   };
 
   jsg::Ref<WorkerStub> get(
