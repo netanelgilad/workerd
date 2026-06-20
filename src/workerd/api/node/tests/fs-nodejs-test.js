@@ -637,6 +637,162 @@ export const writevAsyncCallbackTest = {
   },
 };
 
+// Regression test for Bug A: fs.writev(fd, buffers, undefined, cb) must invoke
+// the callback. Previously an explicit `undefined` position made
+// validatePosition() throw synchronously, so the callback was never scheduled
+// and the write silently hung. The 3-arg form, position 0, and position null
+// always worked; only literal `undefined` dropped the callback. This is exactly
+// what @isaacs/fs-minipass (used by tar) passes for every multi-chunk file:
+//   writev(fd, iovec, this[_pos] /* undefined */, cb)
+export const writevUndefinedPositionCallbackTest = {
+  async test() {
+    const fd = openSync('/tmp/writev-undef.txt', 'w+');
+
+    // The exact repro from the bug report: position === undefined.
+    const written = await new Promise((resolve, reject) => {
+      writev(
+        fd,
+        [Buffer.from('ab'), Buffer.from('cd')],
+        undefined,
+        (err, bw) => {
+          if (err) return reject(err);
+          resolve(bw);
+        }
+      );
+    });
+    strictEqual(written, 4);
+
+    // undefined position writes at the current position, like null. A second
+    // call should append rather than overwrite.
+    const written2 = await new Promise((resolve, reject) => {
+      writev(fd, [Buffer.from('ef')], undefined, (err, bw) => {
+        if (err) return reject(err);
+        resolve(bw);
+      });
+    });
+    strictEqual(written2, 2);
+
+    closeSync(fd);
+    strictEqual(readFileSync('/tmp/writev-undef.txt').toString(), 'abcdef');
+    unlinkSync('/tmp/writev-undef.txt');
+  },
+};
+
+// Regression test for Bug B (tar Unpack pipeline hang). tar writes many files
+// via @isaacs/fs-minipass WriteStream, which uses fs.write for single-chunk
+// files and fs.writev(fd, iovec, this[_pos], cb) for multi-chunk files. For a
+// non-`start` WriteStream this[_pos] is `undefined`, so every multi-chunk file
+// hit Bug A: writev(fd, buffers, undefined, cb) threw synchronously and the
+// completion callback was dropped. tar's pending-file counter then never
+// reached 0 and extraction hung after the first (single-chunk) file. Bug B is
+// therefore a pure manifestation of Bug A, not a separate scheduling/in-flight
+// bug. This test reproduces the composed shape: a concurrent burst of
+// multi-chunk writev + single-chunk 6-arg write (both with undefined position),
+// each followed by close, and asserts every callback fires and every byte
+// lands. Before the Bug A fix, the multi-chunk callbacks never fire and the
+// Promise.all below never resolves (the original hang).
+export const concurrentWritevWriteCloseTest = {
+  async test() {
+    const fileCount = 8;
+    const tasks = [];
+
+    for (let i = 0; i < fileCount; i++) {
+      const path = `/tmp/concurrent-${i}.txt`;
+      const multiChunk = i % 2 === 0;
+      tasks.push(
+        new Promise((resolve, reject) => {
+          const fd = openSync(path, 'w');
+          const onDone = (err, bw) => {
+            if (err) return reject(err);
+            // close must also invoke its callback (fs.close with a cb).
+            close(fd, (closeErr) => {
+              if (closeErr) return reject(closeErr);
+              resolve({ path, bw, multiChunk });
+            });
+          };
+          if (multiChunk) {
+            // Mirrors fs-minipass WriteStream[_flush]: undefined position.
+            writev(
+              fd,
+              [Buffer.from(`file${i}-`), Buffer.from('multi')],
+              undefined,
+              onDone
+            );
+          } else {
+            // Mirrors fs-minipass WriteStream[_write]: 6-arg write with an
+            // undefined position.
+            const buf = Buffer.from(`file${i}-single`);
+            write(fd, buf, 0, buf.length, undefined, onDone);
+          }
+        })
+      );
+    }
+
+    // If any callback is dropped, this Promise.all never resolves and the test
+    // times out (the original failure mode).
+    const results = await Promise.all(tasks);
+    strictEqual(results.length, fileCount);
+
+    for (let i = 0; i < fileCount; i++) {
+      const expected = i % 2 === 0 ? `file${i}-multi` : `file${i}-single`;
+      strictEqual(
+        readFileSync(`/tmp/concurrent-${i}.txt`).toString(),
+        expected
+      );
+      unlinkSync(`/tmp/concurrent-${i}.txt`);
+    }
+  },
+};
+
+// Regression test for the tar-extraction hang: fs.write / fs.writeSync given a
+// typed-array view that sits at a non-zero byteOffset inside a larger
+// ArrayBuffer (exactly what tar's gunzip output / fs-minipass writers hand us).
+// The bounds check in validateWriteArgs used to fold buffer.byteOffset into
+// `offset` and then compare it against `length` (`offset > length`), so any view
+// whose byteOffset exceeded the write length threw ERR_BUFFER_OUT_OF_BOUNDS
+// synchronously. In the async wrapper that synchronous throw escaped the caller
+// and the completion callback was never scheduled -> tar's pending counter never
+// reached 0 -> async `tar.x()` extraction hung forever.
+export const writeSubarrayByteOffsetTest = {
+  async test() {
+    // Build a view with a large byteOffset and a smaller length: byteOffset
+    // (8000) > length (6289), which is what tripped the old check.
+    const backing = Buffer.alloc(20000, 0x41 /* 'A' */);
+    const view = backing.subarray(8000, 8000 + 6289);
+    strictEqual(view.byteOffset, 8000);
+    strictEqual(view.length, 6289);
+
+    // Sync path: must write the full view, not throw.
+    const syncPath = '/tmp/write-subarray-sync.bin';
+    const fdSync = openSync(syncPath, 'w');
+    const bwSync = writeSync(fdSync, view, 0, view.length, null);
+    closeSync(fdSync);
+    strictEqual(bwSync, 6289);
+    strictEqual(statSync(syncPath).size, 6289);
+    strictEqual(readFileSync(syncPath).length, 6289);
+    unlinkSync(syncPath);
+
+    // Async path with an *undefined* position (tar / fs-minipass call shape:
+    // fs.write(fd, buf, 0, buf.length, undefined, cb)). The callback MUST fire.
+    const asyncPath = '/tmp/write-subarray-async.bin';
+    const bwAsync = await new Promise((resolve, reject) => {
+      const fd = openSync(asyncPath, 'w');
+      write(fd, view, 0, view.length, undefined, (err, bw) => {
+        if (err) return reject(err);
+        close(fd, (closeErr) => (closeErr ? reject(closeErr) : resolve(bw)));
+      });
+    });
+    strictEqual(bwAsync, 6289);
+    strictEqual(statSync(asyncPath).size, 6289);
+    // Sanity: the bytes written are the view's bytes (all 'A'), proving the
+    // rebased offset points at the right region of the backing ArrayBuffer.
+    const written = readFileSync(asyncPath);
+    strictEqual(written.length, 6289);
+    ok(written.every((b) => b === 0x41));
+    unlinkSync(asyncPath);
+  },
+};
+
 export const writeFileSyncTest = {
   test() {
     ok(!existsSync('/tmp/test.txt'));

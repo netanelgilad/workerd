@@ -1027,6 +1027,12 @@ export function readv<T extends NodeJS.ArrayBufferView>(
   if (typeof positionOrCallback === 'function') {
     callback = positionOrCallback;
     positionOrCallback = null;
+  } else if (positionOrCallback === undefined) {
+    // Same as writev: an explicit `undefined` position means "current
+    // position" (null), not an invalid argument. Without this,
+    // `validatePosition(undefined)` throws synchronously and the callback is
+    // dropped.
+    positionOrCallback = null;
   }
   if (typeof callback !== 'function') {
     throw new ERR_INVALID_ARG_TYPE('callback', ['function'], callback);
@@ -1378,6 +1384,14 @@ export function writev<T extends NodeJS.ArrayBufferView>(
 ): void {
   if (typeof positionOrCallback === 'function') {
     callback = positionOrCallback;
+    positionOrCallback = null;
+  } else if (positionOrCallback === undefined) {
+    // Node treats an explicit `undefined` position the same as a missing
+    // position / `null`: write at the file's current position. Without this
+    // normalization, `validatePosition(undefined)` below throws synchronously
+    // and the callback is never scheduled. tar / @isaacs/fs-minipass call
+    // `writev(fd, buffers, undefined, cb)` for every multi-chunk file, so this
+    // dropped the completion callback and hung extraction.
     positionOrCallback = null;
   }
   if (typeof callback !== 'function') {
