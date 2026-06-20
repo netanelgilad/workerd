@@ -744,6 +744,55 @@ export const concurrentWritevWriteCloseTest = {
   },
 };
 
+// Regression test for the tar-extraction hang: fs.write / fs.writeSync given a
+// typed-array view that sits at a non-zero byteOffset inside a larger
+// ArrayBuffer (exactly what tar's gunzip output / fs-minipass writers hand us).
+// The bounds check in validateWriteArgs used to fold buffer.byteOffset into
+// `offset` and then compare it against `length` (`offset > length`), so any view
+// whose byteOffset exceeded the write length threw ERR_BUFFER_OUT_OF_BOUNDS
+// synchronously. In the async wrapper that synchronous throw escaped the caller
+// and the completion callback was never scheduled -> tar's pending counter never
+// reached 0 -> async `tar.x()` extraction hung forever.
+export const writeSubarrayByteOffsetTest = {
+  async test() {
+    // Build a view with a large byteOffset and a smaller length: byteOffset
+    // (8000) > length (6289), which is what tripped the old check.
+    const backing = Buffer.alloc(20000, 0x41 /* 'A' */);
+    const view = backing.subarray(8000, 8000 + 6289);
+    strictEqual(view.byteOffset, 8000);
+    strictEqual(view.length, 6289);
+
+    // Sync path: must write the full view, not throw.
+    const syncPath = '/tmp/write-subarray-sync.bin';
+    const fdSync = openSync(syncPath, 'w');
+    const bwSync = writeSync(fdSync, view, 0, view.length, null);
+    closeSync(fdSync);
+    strictEqual(bwSync, 6289);
+    strictEqual(statSync(syncPath).size, 6289);
+    strictEqual(readFileSync(syncPath).length, 6289);
+    unlinkSync(syncPath);
+
+    // Async path with an *undefined* position (tar / fs-minipass call shape:
+    // fs.write(fd, buf, 0, buf.length, undefined, cb)). The callback MUST fire.
+    const asyncPath = '/tmp/write-subarray-async.bin';
+    const bwAsync = await new Promise((resolve, reject) => {
+      const fd = openSync(asyncPath, 'w');
+      write(fd, view, 0, view.length, undefined, (err, bw) => {
+        if (err) return reject(err);
+        close(fd, (closeErr) => (closeErr ? reject(closeErr) : resolve(bw)));
+      });
+    });
+    strictEqual(bwAsync, 6289);
+    strictEqual(statSync(asyncPath).size, 6289);
+    // Sanity: the bytes written are the view's bytes (all 'A'), proving the
+    // rebased offset points at the right region of the backing ArrayBuffer.
+    const written = readFileSync(asyncPath);
+    strictEqual(written.length, 6289);
+    ok(written.every((b) => b === 0x41));
+    unlinkSync(asyncPath);
+  },
+};
+
 export const writeFileSyncTest = {
   test() {
     ok(!existsSync('/tmp/test.txt'));

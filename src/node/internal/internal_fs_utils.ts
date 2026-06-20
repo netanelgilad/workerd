@@ -409,14 +409,12 @@ export function validateWriteArgs(
       } = (offsetOrOptions as WriteSyncOptions | null) || {});
       offset ??= 0;
       validateInteger(offset, 'offset', 0);
-      offset += buffer.byteOffset;
     } else {
       // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
       if (offset != null) {
         validateInteger(offset, 'offset', 0);
       }
       offset ??= 0;
-      offset += buffer.byteOffset;
       length ??= buffer.byteLength;
       position ??= null;
     }
@@ -424,17 +422,27 @@ export function validateWriteArgs(
     validatePosition(position, 'position');
     validateInteger(length, 'length', 0);
 
-    // Validate that the offset + length do not exceed the buffer's byte length.
-    if (length > buffer.byteLength) {
-      throw new ERR_BUFFER_OUT_OF_BOUNDS('length');
-    }
-    if (offset > length) {
+    // `offset` and `length` are relative to the view (`buffer`), so validate
+    // them against the view's own byte length BEFORE rebasing onto the
+    // underlying ArrayBuffer. Note that a typed-array view can sit at a
+    // non-zero `byteOffset` inside a larger ArrayBuffer (e.g. tar's gunzip /
+    // fs-minipass writers hand us such subarrays), so the previous checks
+    // (`length > buffer.byteLength`, `offset > length`) were wrong once
+    // `offset` had `buffer.byteOffset` folded in — they spuriously threw
+    // ERR_BUFFER_OUT_OF_BOUNDS for any view whose byteOffset exceeded the
+    // write length, dropping the async callback and hanging tar extraction.
+    if (offset > buffer.byteLength) {
       throw new ERR_BUFFER_OUT_OF_BOUNDS('offset');
     }
+    if (length > buffer.byteLength - offset) {
+      throw new ERR_BUFFER_OUT_OF_BOUNDS('length');
+    }
 
+    // Rebase the view-relative offset onto the underlying ArrayBuffer so the
+    // returned Buffer points at the correct bytes.
     return {
       fd,
-      buffer: [Buffer.from(buffer.buffer, offset, length)],
+      buffer: [Buffer.from(buffer.buffer, buffer.byteOffset + offset, length)],
       position,
     };
   }
