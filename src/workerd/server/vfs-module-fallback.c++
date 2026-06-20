@@ -880,26 +880,33 @@ ModFormat classify(jsg::Lock& js, Directory& tmpDir, kj::StringPtr filePath, kj:
   if (ext == ".mjs"_kj) return ModFormat::ESM;
   if (ext == ".cjs"_kj) return ModFormat::CJS;
   if (packageTypeIsModule(js, tmpDir, filePath)) return ModFormat::ESM;
-  // Definitive ESM: a statement-position `export`/`import`. This wins even when the file
-  // also contains `exports.`/`require(` — e.g. a bundled `esm/` build (esbuild-wasm's
-  // esm/browser.js has real top-level `export` statements alongside `exports.` inside its
-  // `__export(exports, …)` helpers). A bare substring search misclassified it as CJS and
-  // the top-level `export` then threw "Unexpected token 'export'".
-  if (hasToplevelEsmStatement(src)) return ModFormat::ESM;
-  // Otherwise fall back to the substring heuristic. CommonJS signals: besides the obvious
-  // `module.exports` / `exports.foo` / `require(`, Babel/TypeScript-transpiled CJS marks
-  // itself with `Object.defineProperty(exports, "__esModule", …)` and assigns named exports
-  // via `Object.defineProperty(exports, "name", …)` — touching the `exports` free variable
-  // WITHOUT ever writing `exports.foo` or `module.exports` (e.g.
-  // tailwindcss/lib/lib/collapseAdjacentRules.js). Those have no `require(` either, so the
-  // old heuristic missed them; worse, `import ` can appear inside a comment (`@import url(…)`),
-  // which flipped looksEsm true and mis-loaded the module as ESM ("exports is not defined").
-  bool looksEsm = src.contains("export "_kj) || src.contains("export{"_kj) ||
-      src.contains("export*"_kj) || src.contains("import "_kj) || src.contains("import{"_kj);
-  bool looksCjs = src.contains("module.exports"_kj) || src.contains("exports."_kj) ||
-      src.contains("require("_kj) || src.contains("__esModule"_kj) ||
+  // Definitive CommonJS self-declarations. A file that writes `module.exports`, or that a
+  // transpiler stamped with `__esModule` / `Object.defineProperty(exports, …)`, is CommonJS
+  // — full stop. This MUST be checked before any `export`/`import` detection, because such
+  // files routinely embed `import`/`export` *as data*: sucrase/dist/HelperManager.js is CJS
+  // (`Object.defineProperty(exports, "__esModule", …)`) yet stores ESM helper snippets inside
+  // template literals (a line-leading `import {createRequire} from "module"` in a backtick
+  // string). Honoring the self-declaration first avoids mis-lexing those strings as real
+  // module syntax (which threw "exports is not defined" when the file ran as ESM).
+  bool declaresCjs = src.contains("module.exports"_kj) || src.contains("__esModule"_kj) ||
       src.contains("Object.defineProperty(exports"_kj) ||
       src.contains("Object.defineProperty(module.exports"_kj);
+  if (declaresCjs) return ModFormat::CJS;
+  // Definitive ESM: a statement-position `export`/`import` (begins a logical line, followed
+  // by a statement delimiter — a form that cannot occur in CommonJS). This wins over the
+  // bare-substring heuristic below, so a bundled `esm/` build whose helper code also
+  // references the `exports` free var (esbuild-wasm's esm/browser.js: real top-level
+  // `export` statements alongside `exports.` inside `__export(exports, …)`) is correctly
+  // ESM. A pure substring search had misclassified it as CJS, and the top-level `export`
+  // then threw "Unexpected token 'export'".
+  if (hasToplevelEsmStatement(src)) return ModFormat::ESM;
+  // Fallback substring heuristic for everything else. `exports.foo` / `require(` are weaker
+  // CJS signals (they can appear in ESM helper code), so they only matter here, after the
+  // definitive checks above. `import ` can appear in a comment (`@import url(…)`), so it's a
+  // weak ESM signal too — only decisive when no CJS signal is present.
+  bool looksEsm = src.contains("export "_kj) || src.contains("export{"_kj) ||
+      src.contains("export*"_kj) || src.contains("import "_kj) || src.contains("import{"_kj);
+  bool looksCjs = src.contains("exports."_kj) || src.contains("require("_kj);
   if (looksEsm && !looksCjs) return ModFormat::ESM;
   return ModFormat::CJS;
 }
