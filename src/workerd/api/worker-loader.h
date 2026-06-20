@@ -113,6 +113,16 @@ class WorkerLoader: public jsg::Object {
     // safe in workerd because loaded isolates run on the parent's thread.
     jsg::Optional<bool> shareParentTmp = false;
 
+    // FORK-ONLY (vfs-module-loading): OPT-IN. When true, this dynamically-loaded worker gets a
+    // module fallback that resolves import/require specifiers by reading the worker's OWN virtual
+    // filesystem (node-style: relative paths, bare specifiers via node_modules walking,
+    // package.json main/module, file extensions, CJS vs ESM). Combined with `shareParentTmp: true`,
+    // the child's /tmp IS the parent Durable Object's /tmp, so npm-installed packages under
+    // /tmp/node_modules can be import()/require()d and RUN inside the child. Resolution is fully
+    // synchronous and same-thread (the VFS is in-memory) -- no RPC, socket, or extra thread.
+    // Defaults to false (no VFS module loading, upstream behavior).
+    jsg::Optional<bool> vfsModuleFallback = false;
+
     // TODO(someday): cache API outbound?
 
     JSG_STRUCT(compatibilityDate,
@@ -125,7 +135,8 @@ class WorkerLoader: public jsg::Object {
         globalOutbound,
         tails,
         streamingTails,
-        shareParentTmp);
+        shareParentTmp,
+        vfsModuleFallback);
   };
 
   jsg::Ref<WorkerStub> get(

@@ -500,6 +500,11 @@ struct DynamicWorkerSource {
   // thread-safe and a loaded isolate runs on the parent's thread in workerd.
   kj::Maybe<kj::Rc<Directory>> sharedTmpDir;
 
+  // FORK-ONLY (vfs-module-loading): when true, install a module fallback on the loaded isolate that
+  // resolves modules from the worker's own VFS (see WorkerCode.vfsModuleFallback). This is most
+  // useful together with sharedTmpDir so the resolved files come from the parent's /tmp.
+  bool vfsModuleFallback = false;
+
   // Owns any data structures pointed into by the other members. (E.g. `source` contains a lot of
   // `StringPtr`s; `ownContent` owns the backing buffer for them.)
   kj::Own<void> ownContent;
@@ -527,6 +532,8 @@ struct DynamicWorkerSource {
       // FORK-ONLY (shared-tmp-vfs): share the SAME directory (addRef), not a copy, so re-loads of
       // the isolate keep aliasing the parent's /tmp.
       .sharedTmpDir = sharedTmpDir.map([](kj::Rc<Directory>& d) { return d.addRef(); }),
+      // FORK-ONLY (vfs-module-loading): carry the opt-in through re-loads of the isolate.
+      .vfsModuleFallback = vfsModuleFallback,
       .ownContent = kj::mv(newOwnContent),
       .ownContentIsRpcResponse = ownContentIsRpcResponse,
     };

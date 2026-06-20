@@ -32,6 +32,7 @@
 #include <workerd/server/actor-id-impl.h>
 #include <workerd/server/facet-tree-index.h>
 #include <workerd/server/fallback-service.h>
+#include <workerd/server/vfs-module-fallback.h>
 #include <workerd/util/exception.h>
 #include <workerd/util/http-util.h>
 #include <workerd/util/mimetype.h>
@@ -4530,6 +4531,10 @@ struct Server::WorkerDef {
   // WorkerService and injected into each child IoContext at request start. SAME-THREAD ONLY.
   kj::Maybe<kj::Rc<workerd::Directory>> sharedTmpDir;
 
+  // FORK-ONLY (vfs-module-loading): when true, install a module fallback on this (dynamic) isolate
+  // that resolves modules from the worker's own VFS. See DynamicWorkerSource.vfsModuleFallback.
+  bool vfsModuleFallback = false;
+
   // Callback invoked when abortIsolate() is called. Used by dynamic workers to remove
   // themselves from the loader's isolate map.
   kj::Maybe<kj::Function<void()>> abortIsolateCallback;
@@ -4787,6 +4792,9 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
         // FORK-ONLY (shared-tmp-vfs): carry the parent's shared /tmp dir (if the caller opted in)
         // into the WorkerService so each child request's IoContext can share it. SAME-THREAD ONLY.
         .sharedTmpDir = kj::mv(source.sharedTmpDir),
+        // FORK-ONLY (vfs-module-loading): carry the opt-in into the WorkerService so makeWorkerImpl
+        // installs a VFS-backed module fallback on the child isolate.
+        .vfsModuleFallback = source.vfsModuleFallback,
         // The callback is owned by the WorkerService, which is owned by `this`, so a raw
         // pointer is safe.
         .abortIsolateCallback = kj::Function<void()>([this]() { onAbortIsolate(); }),
@@ -5186,6 +5194,50 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
           }
         }
 
+        return kj::none;
+      });
+    }
+
+    // FORK-ONLY (vfs-module-loading): for an opted-in dynamic worker, install a module fallback
+    // that resolves specifiers from the worker's OWN virtual filesystem (which, when combined with
+    // shareParentTmp, is the parent Durable Object's /tmp). This lets a child import()/require()
+    // npm-installed code from /tmp/node_modules with no fallback service, RPC, or extra thread.
+    if (def.vfsModuleFallback) {
+      KJ_REQUIRE(experimental,
+          "VFS module loading for dynamic workers is an experimental feature. "
+          "You must run workerd with `--experimental` to use it.");
+      // Capture the shared /tmp directory (the parent DO's writable /tmp) so the fallback resolves
+      // against it directly. This is essential: module resolution runs at worker STARTUP, before a
+      // request injects the shared /tmp into the IoContext, so VirtualFileSystem::current(js) would
+      // see a private empty /tmp. The captured Directory is valid at startup. Requires
+      // shareParentTmp:true to be meaningful (otherwise there is nothing to resolve against).
+      KJ_REQUIRE(def.sharedTmpDir != kj::none,
+          "vfsModuleFallback requires shareParentTmp:true so the child can resolve modules from "
+          "the parent's shared /tmp.");
+      auto tmpDir = KJ_ASSERT_NONNULL(def.sharedTmpDir).addRef();
+      auto& apiIsolate = isolate->getApi();
+      apiIsolate.setModuleFallbackCallback(
+          [featureFlags = apiIsolate.getFeatureFlags(), tmpDir = kj::mv(tmpDir)](jsg::Lock& js,
+              kj::StringPtr specifier, kj::Maybe<kj::String> referrer,
+              jsg::CompilationObserver& observer, jsg::ModuleRegistry::ResolveMethod method,
+              kj::Maybe<kj::StringPtr> rawSpecifier) mutable
+          -> kj::Maybe<kj::OneOf<kj::String, jsg::ModuleRegistry::ModuleInfo>> {
+        KJ_IF_SOME(result, workerd::server::resolveModuleFromVfs(
+                               js, *tmpDir, specifier, kj::mv(referrer), method, rawSpecifier)) {
+          KJ_IF_SOME(redirect, result.redirect) {
+            return kj::Maybe<kj::OneOf<kj::String, jsg::ModuleRegistry::ModuleInfo>>(
+                kj::mv(redirect));
+          }
+          KJ_IF_SOME(message, result.moduleMessage) {
+            KJ_IF_SOME(info,
+                WorkerdApi::tryCompileModule(
+                    js, message->getRoot<config::Worker::Module>().asReader(), observer,
+                    featureFlags)) {
+              return kj::Maybe<kj::OneOf<kj::String, jsg::ModuleRegistry::ModuleInfo>>(
+                  kj::mv(info));
+            }
+          }
+        }
         return kj::none;
       });
     }

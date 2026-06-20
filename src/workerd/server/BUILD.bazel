@@ -219,9 +219,11 @@ wd_cc_library(
     name = "server",
     srcs = [
         "server.c++",
+        "vfs-module-fallback.c++",
     ],
     hdrs = [
         "server.h",
+        "vfs-module-fallback.h",
     ],
     deps = [
         ":actor-id-impl",
