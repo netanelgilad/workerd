@@ -837,24 +837,65 @@ bool packageTypeIsModule(jsg::Lock& js, Directory& tmpDir, kj::StringPtr filePat
 
 enum class ModFormat { ESM, CJS, JSON };
 
+// True if `src` contains a statement-position ESM keyword: a `export`/`import` token that
+// begins a logical line (preceded only by start-of-file or a newline + optional whitespace)
+// and is followed by a delimiter that makes it the `export`/`import` *statement* form
+// (space, `{`, `*`, or `(default`). Statement-position `export`/`import` cannot appear in
+// CommonJS, so this is a definitive ESM signal — far stronger than a bare substring search,
+// which trips on `exports.foo` (CJS), `@import url(…)` in comments, or the word "export" in
+// strings. Conservative: only matches the unambiguous statement forms.
+bool hasToplevelEsmStatement(kj::StringPtr src) {
+  auto data = src.asArray();
+  size_t n = data.size();
+  auto atLineStartKeyword = [&](size_t i, kj::StringPtr kw) -> bool {
+    // `i` must be at start-of-file or right after a newline + optional spaces/tabs.
+    size_t j = i;
+    while (j > 0) {
+      char c = data[j - 1];
+      if (c == ' ' || c == '\t') { j--; continue; }
+      if (c == '\n' || c == '\r') break;
+      return false;  // non-whitespace before keyword on this line
+    }
+    // keyword match
+    if (i + kw.size() > n) return false;
+    for (size_t k = 0; k < kw.size(); k++) {
+      if (data[i + k] != kw[k]) return false;
+    }
+    // char following the keyword: must be a delimiter for the statement form
+    char after = (i + kw.size() < n) ? data[i + kw.size()] : '\0';
+    return after == ' ' || after == '\t' || after == '{' || after == '*' ||
+        after == '\n' || after == '\r';
+  };
+  for (size_t i = 0; i < n; i++) {
+    char c = data[i];
+    if (c == 'e' && atLineStartKeyword(i, "export"_kj)) return true;
+    if (c == 'i' && atLineStartKeyword(i, "import"_kj)) return true;
+  }
+  return false;
+}
+
 ModFormat classify(jsg::Lock& js, Directory& tmpDir, kj::StringPtr filePath, kj::StringPtr src) {
   auto ext = extnameOf(filePath);
   if (ext == ".json"_kj) return ModFormat::JSON;
   if (ext == ".mjs"_kj) return ModFormat::ESM;
   if (ext == ".cjs"_kj) return ModFormat::CJS;
   if (packageTypeIsModule(js, tmpDir, filePath)) return ModFormat::ESM;
-  // Heuristic: ESM if it has top-level import/export and no obvious CommonJS exports.
+  // Definitive ESM: a statement-position `export`/`import`. This wins even when the file
+  // also contains `exports.`/`require(` — e.g. a bundled `esm/` build (esbuild-wasm's
+  // esm/browser.js has real top-level `export` statements alongside `exports.` inside its
+  // `__export(exports, …)` helpers). A bare substring search misclassified it as CJS and
+  // the top-level `export` then threw "Unexpected token 'export'".
+  if (hasToplevelEsmStatement(src)) return ModFormat::ESM;
+  // Otherwise fall back to the substring heuristic. CommonJS signals: besides the obvious
+  // `module.exports` / `exports.foo` / `require(`, Babel/TypeScript-transpiled CJS marks
+  // itself with `Object.defineProperty(exports, "__esModule", …)` and assigns named exports
+  // via `Object.defineProperty(exports, "name", …)` — touching the `exports` free variable
+  // WITHOUT ever writing `exports.foo` or `module.exports` (e.g.
+  // tailwindcss/lib/lib/collapseAdjacentRules.js). Those have no `require(` either, so the
+  // old heuristic missed them; worse, `import ` can appear inside a comment (`@import url(…)`),
+  // which flipped looksEsm true and mis-loaded the module as ESM ("exports is not defined").
   bool looksEsm = src.contains("export "_kj) || src.contains("export{"_kj) ||
       src.contains("export*"_kj) || src.contains("import "_kj) || src.contains("import{"_kj);
-  // CommonJS signals. Besides the obvious `module.exports` / `exports.foo` / `require(`,
-  // Babel- and TypeScript-transpiled CJS marks itself with
-  // `Object.defineProperty(exports, "__esModule", { value: true })` and assigns named
-  // exports via `Object.defineProperty(exports, "name", …)` — i.e. it touches the `exports`
-  // free variable WITHOUT ever writing `exports.foo` or `module.exports`. Such files
-  // (e.g. tailwindcss/lib/lib/collapseAdjacentRules.js) have no `require(` either, so the
-  // old heuristic missed them; worse, the string `import ` can appear inside a comment
-  // (`@import url(…)`), which flipped looksEsm to true and mis-loaded the module as ESM
-  // ("exports is not defined" at eval). Treat the transpiled-CJS markers as CJS signals.
   bool looksCjs = src.contains("module.exports"_kj) || src.contains("exports."_kj) ||
       src.contains("require("_kj) || src.contains("__esModule"_kj) ||
       src.contains("Object.defineProperty(exports"_kj) ||
