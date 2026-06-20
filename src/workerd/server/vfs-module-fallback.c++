@@ -147,6 +147,369 @@ kj::Maybe<kj::String> vfsReadText(jsg::Lock& js, Directory& tmpDir, kj::StringPt
 }
 
 // ======================================================================================
+// Minimal JSON parser. We only need it to navigate package.json `exports` / `imports` maps
+// (objects, strings, arrays, null) -- enough to implement Node's PACKAGE_EXPORTS_RESOLVE without
+// dragging a full JSON library into this translation unit. Numbers/booleans are parsed but unused.
+
+struct JsonValue;
+using JsonObject = kj::Vector<kj::Tuple<kj::String, kj::Own<JsonValue>>>;
+using JsonArray = kj::Vector<kj::Own<JsonValue>>;
+
+struct JsonValue {
+  enum class Type { NUL, BOOL, NUMBER, STRING, ARRAY, OBJECT };
+  Type type = Type::NUL;
+  kj::String str;          // STRING
+  JsonArray arr;           // ARRAY
+  JsonObject obj;          // OBJECT (insertion-ordered: condition order matters in `exports`)
+
+  // Lookup a key in an OBJECT, preserving insertion order semantics for callers that iterate.
+  kj::Maybe<JsonValue&> get(kj::StringPtr key) {
+    if (type != Type::OBJECT) return kj::none;
+    for (auto& e: obj) {
+      if (kj::get<0>(e) == key) return *kj::get<1>(e);
+    }
+    return kj::none;
+  }
+};
+
+class JsonParser {
+ public:
+  explicit JsonParser(kj::StringPtr text): s(text), pos(0) {}
+
+  kj::Maybe<kj::Own<JsonValue>> parse() {
+    skipWs();
+    auto v = parseValue();
+    return v;
+  }
+
+ private:
+  kj::StringPtr s;
+  size_t pos;
+
+  void skipWs() {
+    while (pos < s.size()) {
+      char c = s[pos];
+      if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+        pos++;
+      } else {
+        break;
+      }
+    }
+  }
+
+  kj::Maybe<kj::Own<JsonValue>> parseValue() {
+    skipWs();
+    if (pos >= s.size()) return kj::none;
+    char c = s[pos];
+    if (c == '{') return parseObject();
+    if (c == '[') return parseArray();
+    if (c == '"') return parseString();
+    if (c == 't' || c == 'f') return parseBool();
+    if (c == 'n') return parseNull();
+    return parseNumber();
+  }
+
+  kj::Maybe<kj::Own<JsonValue>> parseString() {
+    KJ_IF_SOME(str, parseRawString()) {
+      auto v = kj::heap<JsonValue>();
+      v->type = JsonValue::Type::STRING;
+      v->str = kj::mv(str);
+      return kj::mv(v);
+    }
+    return kj::none;
+  }
+
+  // Parse a JSON string literal (assumes current char is the opening quote). Handles the escapes
+  // that actually appear in package.json export maps.
+  kj::Maybe<kj::String> parseRawString() {
+    if (pos >= s.size() || s[pos] != '"') return kj::none;
+    pos++;  // opening quote
+    kj::Vector<char> out;
+    while (pos < s.size()) {
+      char c = s[pos++];
+      if (c == '"') {
+        out.add('\0');
+        return kj::String(out.releaseAsArray());
+      }
+      if (c == '\\' && pos < s.size()) {
+        char e = s[pos++];
+        switch (e) {
+          case 'n': out.add('\n'); break;
+          case 't': out.add('\t'); break;
+          case 'r': out.add('\r'); break;
+          case 'b': out.add('\b'); break;
+          case 'f': out.add('\f'); break;
+          case '/': out.add('/'); break;
+          case '\\': out.add('\\'); break;
+          case '"': out.add('"'); break;
+          case 'u': {
+            // Skip 4 hex digits; emit '?' (export maps never use non-ASCII for paths).
+            for (int i = 0; i < 4 && pos < s.size(); i++) pos++;
+            out.add('?');
+            break;
+          }
+          default: out.add(e); break;
+        }
+      } else {
+        out.add(c);
+      }
+    }
+    return kj::none;  // unterminated
+  }
+
+  kj::Maybe<kj::Own<JsonValue>> parseObject() {
+    pos++;  // '{'
+    auto v = kj::heap<JsonValue>();
+    v->type = JsonValue::Type::OBJECT;
+    skipWs();
+    if (pos < s.size() && s[pos] == '}') {
+      pos++;
+      return kj::mv(v);
+    }
+    while (pos < s.size()) {
+      skipWs();
+      KJ_IF_SOME(key, parseRawString()) {
+        skipWs();
+        if (pos >= s.size() || s[pos] != ':') return kj::none;
+        pos++;  // ':'
+        KJ_IF_SOME(val, parseValue()) {
+          v->obj.add(kj::tuple(kj::mv(key), kj::mv(val)));
+        } else {
+          return kj::none;
+        }
+      } else {
+        return kj::none;
+      }
+      skipWs();
+      if (pos >= s.size()) return kj::none;
+      if (s[pos] == ',') {
+        pos++;
+        continue;
+      }
+      if (s[pos] == '}') {
+        pos++;
+        return kj::mv(v);
+      }
+      return kj::none;
+    }
+    return kj::none;
+  }
+
+  kj::Maybe<kj::Own<JsonValue>> parseArray() {
+    pos++;  // '['
+    auto v = kj::heap<JsonValue>();
+    v->type = JsonValue::Type::ARRAY;
+    skipWs();
+    if (pos < s.size() && s[pos] == ']') {
+      pos++;
+      return kj::mv(v);
+    }
+    while (pos < s.size()) {
+      KJ_IF_SOME(val, parseValue()) {
+        v->arr.add(kj::mv(val));
+      } else {
+        return kj::none;
+      }
+      skipWs();
+      if (pos >= s.size()) return kj::none;
+      if (s[pos] == ',') {
+        pos++;
+        continue;
+      }
+      if (s[pos] == ']') {
+        pos++;
+        return kj::mv(v);
+      }
+      return kj::none;
+    }
+    return kj::none;
+  }
+
+  kj::Maybe<kj::Own<JsonValue>> parseBool() {
+    auto v = kj::heap<JsonValue>();
+    v->type = JsonValue::Type::BOOL;
+    if (s.slice(pos).startsWith("true"_kj)) {
+      pos += 4;
+      return kj::mv(v);
+    }
+    if (s.slice(pos).startsWith("false"_kj)) {
+      pos += 5;
+      return kj::mv(v);
+    }
+    return kj::none;
+  }
+
+  kj::Maybe<kj::Own<JsonValue>> parseNull() {
+    if (s.slice(pos).startsWith("null"_kj)) {
+      pos += 4;
+      auto v = kj::heap<JsonValue>();
+      v->type = JsonValue::Type::NUL;
+      return kj::mv(v);
+    }
+    return kj::none;
+  }
+
+  kj::Maybe<kj::Own<JsonValue>> parseNumber() {
+    size_t start = pos;
+    while (pos < s.size()) {
+      char c = s[pos];
+      if ((c >= '0' && c <= '9') || c == '-' || c == '+' || c == '.' || c == 'e' || c == 'E') {
+        pos++;
+      } else {
+        break;
+      }
+    }
+    if (pos == start) return kj::none;
+    auto v = kj::heap<JsonValue>();
+    v->type = JsonValue::Type::NUMBER;
+    v->str = kj::str(s.slice(start, pos));
+    return kj::mv(v);
+  }
+};
+
+// Parse a package.json's top-level value once. Returns kj::none on malformed input.
+kj::Maybe<kj::Own<JsonValue>> parsePackageJson(kj::StringPtr text) {
+  JsonParser p(text);
+  return p.parse();
+}
+
+// ======================================================================================
+// Node-style conditional `exports` / `imports` resolution (subset of the ESM spec).
+//
+// We pick conditions to honor based on resolve method + the fact that we always run in a
+// node/default (NOT browser) environment. Order of preference within a conditions object follows
+// the object's own key order (Node semantics), so we iterate `obj` in insertion order.
+
+// Returns true if a condition name should be honored. `forImport` selects import vs require.
+bool conditionMatches(kj::StringPtr cond, bool forImport) {
+  if (cond == "default"_kj) return true;
+  if (cond == "node"_kj) return true;
+  if (cond == "node-addons"_kj) return true;
+  // We explicitly do NOT honor "browser" -- we want the node/default build (Vite's deps ship
+  // browser builds that pull in browser-only globals).
+  if (cond == "import"_kj || cond == "module"_kj || cond == "module-sync"_kj) return forImport;
+  if (cond == "require"_kj) return !forImport;
+  // Vite uses a "development" / "production" split for some deps; prefer development (it has the
+  // full, unminified resolver paths and is what `vite` runs under by default).
+  if (cond == "development"_kj) return true;
+  if (cond == "production"_kj) return false;
+  return false;
+}
+
+// Forward declaration: recursively resolve an exports/imports *target* (string, array of fallbacks,
+// or nested conditions object) into a relative path (begins with "./"). `patternMatch` is the text
+// captured by a "*" in the key, substituted into "*" in the target (subpath patterns).
+kj::Maybe<kj::String> resolveTarget(
+    JsonValue& target, kj::StringPtr patternMatch, bool forImport) {
+  switch (target.type) {
+    case JsonValue::Type::STRING: {
+      // Substitute every "*" in the target with the captured pattern text.
+      auto& t = target.str;
+      if (!t.startsWith("./") && !t.startsWith("../") && !t.startsWith("/")) {
+        // Targets must be relative for our purposes (bare re-exports like "node:fs" are handled by
+        // the caller bailing to native resolution). Reject otherwise.
+        if (!t.startsWith("#")) return kj::none;
+      }
+      if (patternMatch.size() == 0 && !t.contains("*"_kj)) {
+        return kj::str(t);
+      }
+      // Replace all '*' with patternMatch.
+      kj::Vector<char> out;
+      for (char c: t) {
+        if (c == '*') {
+          for (char pc: patternMatch) out.add(pc);
+        } else {
+          out.add(c);
+        }
+      }
+      out.add('\0');
+      return kj::String(out.releaseAsArray());
+    }
+    case JsonValue::Type::OBJECT: {
+      // Conditions object: first matching condition wins (insertion order).
+      for (auto& e: target.obj) {
+        kj::StringPtr cond = kj::get<0>(e);
+        if (conditionMatches(cond, forImport)) {
+          KJ_IF_SOME(r, resolveTarget(*kj::get<1>(e), patternMatch, forImport)) {
+            return kj::mv(r);
+          }
+        }
+      }
+      return kj::none;
+    }
+    case JsonValue::Type::ARRAY: {
+      // Fallback array: first resolvable entry wins.
+      for (auto& el: target.arr) {
+        KJ_IF_SOME(r, resolveTarget(*el, patternMatch, forImport)) {
+          return kj::mv(r);
+        }
+      }
+      return kj::none;
+    }
+    default:
+      return kj::none;
+  }
+}
+
+// Given an `exports` (or `imports`) map value and a subpath key (e.g. "." or "./foo" or "#dep"),
+// resolve to a relative target path. Implements exact-match first, then longest-matching "*"
+// pattern (PACKAGE_IMPORTS_EXPORTS_RESOLVE).
+kj::Maybe<kj::String> resolveExportsKey(
+    JsonValue& exportsVal, kj::StringPtr subpath, bool forImport) {
+  // Case A: exports is a string / array / conditions-without-subpath-keys, and subpath is ".".
+  // Node treats `"exports": "./x.js"` or `"exports": { "import": ..., "require": ... }` as the "."
+  // entry. We detect "conditions object" vs "subpath object" by whether keys start with "." or "#".
+  bool isSubpathMap = false;
+  if (exportsVal.type == JsonValue::Type::OBJECT) {
+    for (auto& e: exportsVal.obj) {
+      kj::StringPtr k = kj::get<0>(e);
+      if (k.startsWith("."_kj) || k.startsWith("#"_kj)) {
+        isSubpathMap = true;
+      }
+      break;  // Node: a map is either all-subpath-keys or all-condition-keys; check the first.
+    }
+  }
+
+  if (!isSubpathMap) {
+    // Sugar form: the whole value is the target for ".".
+    if (subpath != "."_kj) return kj::none;
+    return resolveTarget(exportsVal, ""_kj, forImport);
+  }
+
+  // Subpath map. 1) exact match.
+  KJ_IF_SOME(exact, exportsVal.get(subpath)) {
+    return resolveTarget(exact, ""_kj, forImport);
+  }
+
+  // 2) longest "*" pattern match. Keys look like "./foo/*" or "./*" (or "#internal/*").
+  kj::Maybe<kj::String> bestMatch;
+  kj::Maybe<JsonValue&> bestTarget;
+  size_t bestPrefixLen = 0;
+  for (auto& e: exportsVal.obj) {
+    kj::StringPtr key = kj::get<0>(e);
+    KJ_IF_SOME(starPos, key.findFirst('*')) {
+      auto prefix = kj::str(key.slice(0, starPos));
+      auto suffix = kj::str(key.slice(starPos + 1));
+      if (subpath.size() < prefix.size() + suffix.size()) continue;
+      if (!subpath.startsWith(prefix)) continue;
+      if (suffix.size() > 0 && !subpath.endsWith(suffix)) continue;
+      // Capture the text matched by '*'.
+      auto captured = subpath.slice(prefix.size(), subpath.size() - suffix.size());
+      if (prefix.size() >= bestPrefixLen) {
+        bestPrefixLen = prefix.size();
+        bestMatch = kj::str(captured);
+        bestTarget = *kj::get<1>(e);
+      }
+    }
+  }
+  KJ_IF_SOME(target, bestTarget) {
+    auto captured = KJ_ASSERT_NONNULL(bestMatch).asPtr();
+    return resolveTarget(target, captured, forImport);
+  }
+  return kj::none;
+}
+
+// ======================================================================================
 // node-style resolution
 
 const kj::StringPtr kExtensionsImport[] = {".js"_kj, ".mjs"_kj, ".cjs"_kj, ".json"_kj};
@@ -177,9 +540,32 @@ kj::Maybe<kj::String> readPackageEntry(
 
 kj::Maybe<kj::String> resolveAsDirectory(
     jsg::Lock& js, Directory& tmpDir, kj::StringPtr dir, jsg::ModuleRegistry::ResolveMethod method) {
-  // package.json main/module/exports
+  bool forImport = method != jsg::ModuleRegistry::ResolveMethod::REQUIRE;
+  // package.json exports/main/module
   auto pkgJsonPath = kj::str(dir, "/package.json");
   KJ_IF_SOME(pkgText, vfsReadText(js, tmpDir, pkgJsonPath)) {
+    KJ_IF_SOME(parsed, parsePackageJson(pkgText)) {
+      // 1) `exports` takes precedence over main/module when present. Resolve the "." subpath.
+      KJ_IF_SOME(exportsVal, parsed->get("exports"_kj)) {
+        KJ_IF_SOME(rel, resolveExportsKey(exportsVal, "."_kj, forImport)) {
+          auto target = joinPath(dir, rel);
+          // exports targets are exact (no extension probing per spec) but be lenient: try the file,
+          // then with extensions, then index.
+          KJ_IF_SOME(file, resolveAsFile(js, tmpDir, target, method)) {
+            return kj::mv(file);
+          }
+          auto indexInTarget = kj::str(target, "/index");
+          KJ_IF_SOME(file, resolveAsFile(js, tmpDir, indexInTarget, method)) {
+            return kj::mv(file);
+          }
+        }
+        // When `exports` exists but the "." entry doesn't resolve, Node blocks falling back to
+        // main. But empirically many packages still want main if exports has only subpaths and no
+        // ".". We only block when a "." (or sugar) entry existed. Fall through to main otherwise.
+      }
+    }
+
+    // 2) Legacy main/module.
     KJ_IF_SOME(entry, readPackageEntry(js, pkgText, method)) {
       auto target = joinPath(dir, entry);
       KJ_IF_SOME(file, resolveAsFile(js, tmpDir, target, method)) {
@@ -197,24 +583,113 @@ kj::Maybe<kj::String> resolveAsDirectory(
   return resolveAsFile(js, tmpDir, indexPath, method);
 }
 
+// Split a bare specifier into a package name and the subpath portion ("." for the root). Handles
+// scoped packages (@scope/name) and deep subpaths (name/sub/path).
+//   "foo"            -> ("foo", ".")
+//   "foo/bar"        -> ("foo", "./bar")
+//   "@s/foo"         -> ("@s/foo", ".")
+//   "@s/foo/bar"     -> ("@s/foo", "./bar")
+struct PackageSpec {
+  kj::String name;
+  kj::String subpath;  // "." or "./..."
+};
+PackageSpec splitBareSpecifier(kj::StringPtr spec) {
+  size_t slashCount = spec.startsWith("@") ? 2 : 1;
+  size_t seen = 0;
+  size_t nameEnd = spec.size();
+  for (size_t i = 0; i < spec.size(); i++) {
+    if (spec[i] == '/') {
+      seen++;
+      if (seen == slashCount) {
+        nameEnd = i;
+        break;
+      }
+    }
+  }
+  auto name = kj::str(spec.slice(0, nameEnd));
+  kj::String subpath;
+  if (nameEnd >= spec.size()) {
+    subpath = kj::str(".");
+  } else {
+    subpath = kj::str(".", spec.slice(nameEnd));  // -> "./rest"
+  }
+  return PackageSpec{.name = kj::mv(name), .subpath = kj::mv(subpath)};
+}
+
+// Resolve a bare specifier against a single package directory (`pkgDir`), honoring an `exports`
+// map when present (which then BLOCKS any subpath not listed, like Node). Returns kj::none if this
+// package dir doesn't satisfy the specifier so the caller keeps walking up node_modules.
+kj::Maybe<kj::String> resolveInPackage(jsg::Lock& js,
+    Directory& tmpDir,
+    kj::StringPtr pkgDir,
+    kj::StringPtr subpath,
+    jsg::ModuleRegistry::ResolveMethod method) {
+  bool forImport = method != jsg::ModuleRegistry::ResolveMethod::REQUIRE;
+  auto pkgJsonPath = kj::str(pkgDir, "/package.json");
+  KJ_IF_SOME(pkgText, vfsReadText(js, tmpDir, pkgJsonPath)) {
+    KJ_IF_SOME(parsed, parsePackageJson(pkgText)) {
+      KJ_IF_SOME(exportsVal, parsed->get("exports"_kj)) {
+        // exports present: it is authoritative. A subpath not covered by exports is blocked.
+        KJ_IF_SOME(rel, resolveExportsKey(exportsVal, subpath, forImport)) {
+          auto target = joinPath(pkgDir, rel);
+          KJ_IF_SOME(file, resolveAsFile(js, tmpDir, target, method)) {
+            return kj::mv(file);
+          }
+          // exports may point at a directory index (rare but legal via "./foo/").
+          auto indexInTarget = kj::str(target, "/index");
+          KJ_IF_SOME(file, resolveAsFile(js, tmpDir, indexInTarget, method)) {
+            return kj::mv(file);
+          }
+          // exports matched but file missing -> hard fail for this package (Node behavior).
+          return kj::none;
+        }
+        // exports present but subpath not exported. For "." fall through to main/module/index
+        // (handled by resolveAsDirectory). For deep subpaths, Node blocks; we mirror that by
+        // returning none so the deep path isn't reachable through the legacy file walk.
+        if (subpath != "."_kj) {
+          return kj::none;
+        }
+      }
+    }
+  }
+
+  // No exports (or "." not exported): legacy resolution.
+  if (subpath == "."_kj) {
+    KJ_IF_SOME(file, resolveAsFile(js, tmpDir, pkgDir, method)) {
+      return kj::mv(file);
+    }
+    if (vfsIsDir(js, tmpDir, pkgDir)) {
+      return resolveAsDirectory(js, tmpDir, pkgDir, method);
+    }
+    return kj::none;
+  }
+
+  // Deep subpath without exports: resolve relative to the package dir.
+  auto target = joinPath(pkgDir, subpath);
+  KJ_IF_SOME(file, resolveAsFile(js, tmpDir, target, method)) {
+    return kj::mv(file);
+  }
+  if (vfsIsDir(js, tmpDir, target)) {
+    return resolveAsDirectory(js, tmpDir, target, method);
+  }
+  return kj::none;
+}
+
 // Walk node_modules up the directory tree starting at `fromDir`, looking for the bare specifier.
 kj::Maybe<kj::String> resolveBare(jsg::Lock& js,
     Directory& tmpDir,
     kj::StringPtr fromDir,
     kj::StringPtr spec,
     jsg::ModuleRegistry::ResolveMethod method) {
+  auto split = splitBareSpecifier(spec);
   auto dir = kj::str(fromDir);
   while (true) {
     // Skip a node_modules dir nested inside another node_modules path component duplication is
     // fine; node walks every ancestor including ones already under node_modules.
-    auto candidateBase = kj::str(dir, "/node_modules/", spec);
-    // 1) as a file (with extensions)
-    KJ_IF_SOME(file, resolveAsFile(js, tmpDir, candidateBase, method)) {
-      return kj::mv(file);
-    }
-    // 2) as a directory (package.json / index)
-    if (vfsIsDir(js, tmpDir, candidateBase)) {
-      KJ_IF_SOME(file, resolveAsDirectory(js, tmpDir, candidateBase, method)) {
+    auto pkgDir = kj::str(dir, "/node_modules/", split.name);
+    if (vfsIsDir(js, tmpDir, pkgDir) ||
+        vfsIsFile(js, tmpDir, kj::str(dir, "/node_modules/", split.name))) {
+      KJ_IF_SOME(file, resolveInPackage(js, tmpDir, pkgDir, split.subpath, method)) {
         return kj::mv(file);
       }
     }
@@ -222,6 +697,50 @@ kj::Maybe<kj::String> resolveBare(jsg::Lock& js,
     if (dir == kVfsRoot || dir == "/"_kj || dir.size() <= kVfsRoot.size()) {
       break;
     }
+    auto parent = dirnameOf(dir);
+    if (parent == dir) break;
+    dir = kj::mv(parent);
+  }
+  return kj::none;
+}
+
+// Resolve a `#`-prefixed `imports` specifier relative to the nearest package.json walking up from
+// `fromDir`. Returns the absolute VFS path of the resolved module, or kj::none.
+kj::Maybe<kj::String> resolveImports(jsg::Lock& js,
+    Directory& tmpDir,
+    kj::StringPtr fromDir,
+    kj::StringPtr spec,
+    jsg::ModuleRegistry::ResolveMethod method) {
+  bool forImport = method != jsg::ModuleRegistry::ResolveMethod::REQUIRE;
+  auto dir = kj::str(fromDir);
+  while (true) {
+    auto pkgJsonPath = kj::str(dir, "/package.json");
+    KJ_IF_SOME(pkgText, vfsReadText(js, tmpDir, pkgJsonPath)) {
+      KJ_IF_SOME(parsed, parsePackageJson(pkgText)) {
+        KJ_IF_SOME(importsVal, parsed->get("imports"_kj)) {
+          KJ_IF_SOME(rel, resolveExportsKey(importsVal, spec, forImport)) {
+            // An imports target may be a relative path (resolved against the package dir) OR a bare
+            // specifier (resolved through node_modules from the package dir).
+            if (rel.startsWith("./") || rel.startsWith("../") || rel.startsWith("/")) {
+              auto target = joinPath(dir, rel);
+              KJ_IF_SOME(file, resolveAsFile(js, tmpDir, target, method)) {
+                return kj::mv(file);
+              }
+              if (vfsIsDir(js, tmpDir, target)) {
+                return resolveAsDirectory(js, tmpDir, target, method);
+              }
+              return kj::none;
+            }
+            // Bare re-export (e.g. "#dep": "some-pkg").
+            return resolveBare(js, tmpDir, dir, rel, method);
+          }
+        }
+      }
+      // Found the nearest package.json; whether or not imports matched, stop here (Node resolves
+      // imports against the nearest package scope only).
+      return kj::none;
+    }
+    if (dir == kVfsRoot || dir == "/"_kj || dir.size() <= kVfsRoot.size()) break;
     auto parent = dirnameOf(dir);
     if (parent == dir) break;
     dir = kj::mv(parent);
@@ -271,6 +790,11 @@ kj::Maybe<kj::String> nodeResolve(jsg::Lock& js,
     return kj::none;
   }
 
+  // `#`-prefixed private imports map. Resolved against the nearest package.json above the importer.
+  if (rawSpec.startsWith("#")) {
+    return resolveImports(js, tmpDir, baseDir, rawSpec, method);
+  }
+
   // Bare specifier (incl. scoped packages and subpaths). Walk node_modules.
   return resolveBare(js, tmpDir, baseDir, rawSpec, method);
 }
@@ -278,25 +802,22 @@ kj::Maybe<kj::String> nodeResolve(jsg::Lock& js,
 // ======================================================================================
 // Source classification + named-export discovery.
 
-// Walk up from the module file looking for the nearest package.json `type`.
+// Walk up from the module file looking for the nearest package.json `type` field. The first
+// package.json found wins (Node's nearest-scope rule) regardless of whether it declares `type`.
 bool packageTypeIsModule(jsg::Lock& js, Directory& tmpDir, kj::StringPtr filePath) {
   auto dir = dirnameOf(filePath);
   while (true) {
     auto pkgJsonPath = kj::str(dir, "/package.json");
     KJ_IF_SOME(text, vfsReadText(js, tmpDir, pkgJsonPath)) {
-      // crude scan for "type":"module"
-      return text.contains("\"type\""_kj) && text.contains("\"module\""_kj) &&
-          // ensure the "module" value is associated with "type" (best-effort)
-          [&]() {
-            KJ_IF_SOME(tpos, text.find("\"type\""_kj)) {
-              auto after = text.slice(tpos);
-              KJ_IF_SOME(mpos, after.find("\"module\""_kj)) {
-                // "module" appears shortly after "type"
-                return mpos < 32;
-              }
-            }
-            return false;
-          }();
+      KJ_IF_SOME(parsed, parsePackageJson(text)) {
+        KJ_IF_SOME(typeVal, parsed->get("type"_kj)) {
+          if (typeVal.type == JsonValue::Type::STRING) {
+            return typeVal.str == "module"_kj;
+          }
+        }
+      }
+      // Nearest package.json found but no (parseable) `type` -> defaults to CommonJS scope.
+      return false;
     }
     if (dir == kVfsRoot || dir == "/"_kj || dir.size() <= kVfsRoot.size()) break;
     auto parent = dirnameOf(dir);

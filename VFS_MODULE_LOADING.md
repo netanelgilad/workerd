@@ -123,21 +123,41 @@ This ports the proven resolution + classification logic from the host harness
 - Relative (`./`, `../`) and absolute (`/tmp/...`) specifiers.
 - Bare specifiers (incl. scoped `@scope/pkg` and subpaths) via `node_modules` walking up
   to `/tmp`.
-- `package.json` field priority: `module` then `main` for import; `main` for require.
+- **`package.json` conditional `exports` maps** (Node `PACKAGE_EXPORTS_RESOLVE` subset):
+  - String sugar (`"exports": "./x.js"`) for the `.` entry.
+  - Conditions objects (`import` / `require` / `module` / `node` / `default`, plus
+    `development`→on / `production`→off). **`browser` is intentionally NOT honored** — we
+    want the node/default build. `import` is selected for ESM, `require` for CJS; first
+    matching condition wins in object insertion order.
+  - Subpath exports (`"./feature": "./lib/feature.js"`), nested condition objects, and
+    fallback arrays.
+  - Subpath **patterns** (`"./*": "./dist/*.js"`) with `*` capture+substitution; longest
+    matching prefix wins.
+  - `exports` takes **precedence** over `main`/`module`, and **blocks** deep subpaths not
+    listed in the map (Node behavior).
+- **`package.json` `imports` maps** (`#`-prefixed private specifiers): exact + `*`-pattern
+  keys, resolved against the nearest enclosing `package.json`; targets may be relative
+  paths or bare specifiers (re-resolved through `node_modules`).
+- Legacy fallback `package.json` field priority when no (matching) `exports`: `module`
+  then `main` for import; `main` for require.
 - Extension probing: `.js/.mjs/.cjs/.json` (import), `.js/.cjs/.json` (require);
   directory `index.*`.
-- CJS vs ESM classification: by extension, then nearest `package.json` `"type":"module"`,
-  then a source heuristic.
+- CJS vs ESM classification: by extension (`.mjs`→ESM, `.cjs`→CJS), then nearest
+  `package.json` `"type":"module"` (now parsed with a real JSON parser, not a textual
+  proximity heuristic), then a source heuristic.
 - JSON modules.
 - Best-effort CJS named-export discovery (textual `exports.<name>` scan) so
   `import { x } from "cjs-pkg"` binds; the default/namespace import always works.
 - `node:` / `cloudflare:` / `workerd:` builtins are passed through (never shadowed).
 
+The `exports`/`imports`/`type` logic is backed by a small self-contained JSON parser
+(`JsonParser` in `vfs-module-fallback.c++`) so no JSON library is pulled into the TU.
+
 ## Files changed
 
 | File | Change |
 |------|--------|
-| `src/workerd/server/vfs-module-fallback.h` / `.c++` | **New.** Node-style resolver against a `/tmp` `Directory`; returns redirect or capnp `Worker::Module`. |
+| `src/workerd/server/vfs-module-fallback.h` / `.c++` | **New.** Node-style resolver against a `/tmp` `Directory`; returns redirect or capnp `Worker::Module`. Includes a self-contained JSON parser + conditional `exports`/`imports` map resolution (string/conditions/subpath/`*`-pattern) and JSON-parsed `type:module` detection. |
 | `src/workerd/api/worker-loader.h` | `WorkerCode.vfsModuleFallback` opt-in field (+ `JSG_STRUCT`). |
 | `src/workerd/api/worker-loader.c++` | Forward `code.vfsModuleFallback` into `DynamicWorkerSource`. |
 | `src/workerd/io/io-channels.h` | `DynamicWorkerSource.vfsModuleFallback` field (+ `clone()`). |
@@ -150,7 +170,7 @@ This ports the proven resolution + classification logic from the host harness
 
 ### STAGE 1 (+ core of STAGE 2) — self-contained wd-test
 
-`src/workerd/api/tests/worker-loader-vfs-module-test.js` — 5/5 green. The parent writes
+`src/workerd/api/tests/worker-loader-vfs-module-test.js` — 11/11 green. The parent writes
 module sources into the shared `/tmp`; a child with `vfsModuleFallback:true` resolves and
 runs them:
 
@@ -159,6 +179,14 @@ runs them:
 - `bareCjsFromNodeModules` — `require("adder")` (`module.exports = fn`) from `node_modules`.
 - `relativeAndJson` — relative `import` chain + a JSON module, all under `/tmp`.
 - `transitiveNodeModules` — a package that itself `require()`s a transitive dep.
+- `exportsStringSugar` — `"exports": "./dist/main.js"` wins over a legacy `index.js`.
+- `exportsConditions` — `import`→`./esm`, `require`→`./cjs`, **never** `browser`.
+- `exportsSubpath` — `"./feature"` subpath resolves; a deep path **not** in `exports` is
+  blocked.
+- `exportsSubpathPattern` — `"./*": "./dist/*.js"` resolves `exppat/widget` →
+  `dist/widget.js`.
+- `importsHashMap` — `#internal` (condition target) and `#util/*` (pattern) resolve against
+  the package's own `imports` map.
 - `controlNoFallbackFails` — a child **without** the opt-in fails to import from `/tmp`.
 
 ```bash
@@ -188,6 +216,37 @@ VERDICT: PASS — child ran a real npm-installed package (left-pad) loaded entir
                 from the shared /tmp via CJS require AND ESM import
 ```
 
+### STAGE 3 — real `vite@8` + `@vitejs/plugin-react`, module graph from `/tmp`
+
+`vite-workerd-demo/experiments/npm-in-workerd/scratch-vite/` — a DO installs the **real
+`vite@^8` + `@vitejs/plugin-react`** via Arborist into `/tmp/proj/node_modules`, then loads
+a child (`shareParentTmp` + `vfsModuleFallback`) that does `await import("vite")`,
+`await import("@vitejs/plugin-react")`, and `require("vite")` from the shared `/tmp`.
+
+```bash
+cd /Users/netanelg/Development/vite-workerd-demo/experiments/npm-in-workerd
+MINIFLARE_WORKERD_PATH=/tmp/workerd-vfsmod-bin node scratch-vite/run.mjs
+```
+
+vite's `exports` is `{ ".": "./dist/node/index.js", "./client": {...}, "./*": ..., ... }`;
+plugin-react is `{ "type": "module", "exports": { ".": "./dist/index.js" } }`. Both **fully
+resolve** their module graphs from `/tmp` (string-sugar `.` export, `type:module` ESM
+classification, transitive bare specifiers, conditional deps). Resolution no longer
+produces any `No such module "<bare/relative>"` error. The first **execution-time** error
+(the handoff to the execution task) is a missing Node builtin:
+
+```
+import("vite")               -> Error: No such module "node:readline".
+                                imported from "tmp/proj/node_modules/vite/dist/node/chunks/logger.js"
+import("@vitejs/plugin-react") -> Error: No such module "node:worker_threads".
+                                imported from "tmp/proj/node_modules/rolldown/dist/shared/rolldown-build-*.mjs"
+require("vite")              -> Error: No such module "node:readline". (same logger.js)
+```
+
+These are workerd builtins not implemented (`node:readline`, `node:worker_threads`), not
+resolution failures — exactly the next-task boundary (execution: missing builtins,
+`import.meta.url`, WASM compile, native bundler binaries).
+
 ## Binary
 
 A built workerd with this feature: **`/tmp/workerd-vfsmod-bin`** (does not overwrite
@@ -212,7 +271,11 @@ cp bazel-bin/src/workerd/server/workerd /tmp/workerd-vfsmod-bin
 - **CJS named exports** are discovered by a conservative textual scan; missing one only
   means a *named* import won't bind (default/namespace import still works). For full
   fidelity a cjs-module-lexer-equivalent could be added later.
-- **`package.json` `exports` maps** are not fully implemented — `main`/`module` covers the
-  overwhelming majority of npm packages (including the validation targets). Conditional
-  `exports` can be added if a target package needs it.
-- WASM/`.node` native addons are not served as modules.
+- **`package.json` `exports` / `imports`** are now implemented (see "Resolution semantics").
+  Remaining gaps vs. full Node spec: no `node:`-target re-exports through the map (those
+  pass straight through to native), no `engines`/platform-specific condition arrays beyond
+  the common set, and `*` patterns expand greedily by longest prefix only.
+- WASM/`.node` native addons are not served as modules (execution-task concern).
+- **Resolution is "as far as the module graph"; execution is a separate task.** Resolving
+  real `vite@8` from `/tmp` succeeds all the way through its graph and first fails at
+  runtime on a missing Node builtin (`node:readline`) — see the vite stage below.

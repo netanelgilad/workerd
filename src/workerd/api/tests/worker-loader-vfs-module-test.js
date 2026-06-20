@@ -154,7 +154,194 @@ export let transitiveNodeModules = {
   },
 };
 
-// 5) Control: a child WITHOUT vfsModuleFallback must NOT be able to import from /tmp.
+// 6) package.json "exports" — STRING sugar form for ".".
+export let exportsStringSugar = {
+  async test(ctrl, env, ctx) {
+    mkdirpAndWrite(
+      '/tmp/node_modules/expstr/package.json',
+      JSON.stringify({ name: 'expstr', exports: './dist/main.js' })
+    );
+    mkdirpAndWrite(
+      '/tmp/node_modules/expstr/dist/main.js',
+      `export const tag = "expstr-string";`
+    );
+    // A file at the legacy main location that must NOT win (exports takes precedence).
+    mkdirpAndWrite('/tmp/node_modules/expstr/index.js', `export const tag = "WRONG";`);
+
+    const c = env.loader.get('vfs-exports-string', () =>
+      child(`
+        import { WorkerEntrypoint } from "cloudflare:workers";
+        import { tag } from "expstr";
+        export default class extends WorkerEntrypoint {
+          run() { return tag; }
+        }
+      `)
+    );
+    assert.strictEqual(await c.getEntrypoint().run(), 'expstr-string');
+  },
+};
+
+// 7) package.json "exports" — CONDITIONS object (import vs require). We must pick "import" for ESM
+//    and "require" for CJS, and must NOT pick "browser".
+export let exportsConditions = {
+  async test(ctrl, env, ctx) {
+    mkdirpAndWrite(
+      '/tmp/node_modules/expcond/package.json',
+      JSON.stringify({
+        name: 'expcond',
+        exports: {
+          '.': {
+            browser: './browser.js',
+            import: './esm/index.js',
+            require: './cjs/index.js',
+            default: './default.js',
+          },
+        },
+      })
+    );
+    mkdirpAndWrite('/tmp/node_modules/expcond/esm/index.js', `export const which = "esm";`);
+    mkdirpAndWrite(
+      '/tmp/node_modules/expcond/cjs/index.js',
+      `module.exports = { which: "cjs" };`
+    );
+    mkdirpAndWrite('/tmp/node_modules/expcond/browser.js', `export const which = "browser";`);
+
+    const c = env.loader.get('vfs-exports-cond', () =>
+      child(`
+        import { WorkerEntrypoint } from "cloudflare:workers";
+        import { createRequire } from "node:module";
+        import { which as esmWhich } from "expcond";
+        const require = createRequire("/tmp/main.js");
+        export default class extends WorkerEntrypoint {
+          run() {
+            const cjsWhich = require("expcond").which;
+            return esmWhich + ":" + cjsWhich;
+          }
+        }
+      `)
+    );
+    assert.strictEqual(await c.getEntrypoint().run(), 'esm:cjs');
+  },
+};
+
+// 8) package.json "exports" — explicit SUBPATH ("./feature") + blocking of a non-exported deep path.
+export let exportsSubpath = {
+  async test(ctrl, env, ctx) {
+    mkdirpAndWrite(
+      '/tmp/node_modules/expsub/package.json',
+      JSON.stringify({
+        name: 'expsub',
+        exports: {
+          '.': './index.js',
+          './feature': './lib/feature.js',
+        },
+      })
+    );
+    mkdirpAndWrite('/tmp/node_modules/expsub/index.js', `export const root = "root";`);
+    mkdirpAndWrite(
+      '/tmp/node_modules/expsub/lib/feature.js',
+      `export const feature = "feature-ok";`
+    );
+    // Present on disk but NOT in exports -> must be blocked.
+    mkdirpAndWrite('/tmp/node_modules/expsub/lib/secret.js', `export const secret = "leak";`);
+
+    const c = env.loader.get('vfs-exports-subpath', () =>
+      child(`
+        import { WorkerEntrypoint } from "cloudflare:workers";
+        import { feature } from "expsub/feature";
+        export default class extends WorkerEntrypoint {
+          run() { return feature; }
+          async blocked() {
+            // Not in exports; must fail to resolve.
+            await import("expsub/lib/secret.js");
+            return "should-not-reach";
+          }
+        }
+      `)
+    );
+    const ep = c.getEntrypoint();
+    assert.strictEqual(await ep.run(), 'feature-ok');
+    await assert.rejects(
+      async () => { await ep.blocked(); },
+      (err) => /module|resolve|No such|not found/i.test(String(err)),
+      'a deep path not listed in exports must be blocked'
+    );
+  },
+};
+
+// 9) package.json "exports" — SUBPATH PATTERN ("./*" -> "./dist/*.js" with * substitution).
+export let exportsSubpathPattern = {
+  async test(ctrl, env, ctx) {
+    mkdirpAndWrite(
+      '/tmp/node_modules/exppat/package.json',
+      JSON.stringify({
+        name: 'exppat',
+        exports: {
+          '.': './dist/index.js',
+          './*': './dist/*.js',
+        },
+      })
+    );
+    mkdirpAndWrite('/tmp/node_modules/exppat/dist/index.js', `export const k = "idx";`);
+    mkdirpAndWrite('/tmp/node_modules/exppat/dist/widget.js', `export const k = "widget";`);
+
+    const c = env.loader.get('vfs-exports-pattern', () =>
+      child(`
+        import { WorkerEntrypoint } from "cloudflare:workers";
+        import { k } from "exppat/widget";
+        export default class extends WorkerEntrypoint {
+          run() { return k; }
+        }
+      `)
+    );
+    assert.strictEqual(await c.getEntrypoint().run(), 'widget');
+  },
+};
+
+// 10) package.json "imports" — "#"-prefixed internal map (relative target + condition).
+export let importsHashMap = {
+  async test(ctrl, env, ctx) {
+    mkdirpAndWrite(
+      '/tmp/node_modules/imppkg/package.json',
+      JSON.stringify({
+        name: 'imppkg',
+        type: 'module',
+        main: './index.js',
+        imports: {
+          '#internal': { import: './internal/impl.js', default: './internal/impl.js' },
+          '#util/*': './utils/*.js',
+        },
+      })
+    );
+    mkdirpAndWrite(
+      '/tmp/node_modules/imppkg/index.js',
+      `import { secret } from "#internal";
+       import { up } from "#util/strings";
+       export const result = secret + ":" + up("x");`
+    );
+    mkdirpAndWrite(
+      '/tmp/node_modules/imppkg/internal/impl.js',
+      `export const secret = "from-internal";`
+    );
+    mkdirpAndWrite(
+      '/tmp/node_modules/imppkg/utils/strings.js',
+      `export function up(s) { return s.toUpperCase(); }`
+    );
+
+    const c = env.loader.get('vfs-imports-hash', () =>
+      child(`
+        import { WorkerEntrypoint } from "cloudflare:workers";
+        import { result } from "imppkg";
+        export default class extends WorkerEntrypoint {
+          run() { return result; }
+        }
+      `)
+    );
+    assert.strictEqual(await c.getEntrypoint().run(), 'from-internal:X');
+  },
+};
+
+// 11) Control: a child WITHOUT vfsModuleFallback must NOT be able to import from /tmp.
 export let controlNoFallbackFails = {
   async test(ctrl, env, ctx) {
     mkdirpAndWrite(
