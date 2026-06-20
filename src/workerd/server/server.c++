@@ -5295,6 +5295,12 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
   // Extract abortIsolateCallback before moving def into linkCallback lambda
   auto abortIsolateCallback = kj::mv(def.abortIsolateCallback);
 
+  // FORK-ONLY (shared-tmp-vfs): `def` is about to be moved into `linkCallback` below, which would
+  // leave `def.sharedTmpDir` in a moved-from (none) state by the time we construct the
+  // WorkerService further down. Hoist the shared /tmp directory into a local now so it survives the
+  // move and can be forwarded to the WorkerService. SAME-THREAD ONLY.
+  kj::Maybe<kj::Rc<workerd::Directory>> sharedTmpDir = kj::mv(def.sharedTmpDir);
+
   auto linkCallback = [this, def = kj::mv(def), totalActorChannels](WorkerService& workerService,
                           Worker::ValidationErrorReporter& errorReporter) mutable {
     WorkerService::LinkedIoChannels result;
@@ -5455,8 +5461,9 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
           kj::mv(linkCallback), KJ_BIND_METHOD(*this, abortAllActors),
           KJ_BIND_METHOD(*this, deleteAllActors), kj::mv(dockerPath),
           kj::mv(containerEgressInterceptorImage), def.isDynamic, kj::mv(abortIsolateCallback),
-          // FORK-ONLY (shared-tmp-vfs): forward the opt-in shared /tmp dir to the service.
-          kj::mv(def.sharedTmpDir));
+          // FORK-ONLY (shared-tmp-vfs): forward the opt-in shared /tmp dir to the service. Read from
+          // the hoisted local (not def.sharedTmpDir, which was moved-from into linkCallback above).
+          kj::mv(sharedTmpDir));
   result->initActorNamespaces(def.localActorConfigs, actorNamespacesByUniqueKey, network);
   co_return result;
 }
