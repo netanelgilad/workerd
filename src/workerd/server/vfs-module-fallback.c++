@@ -387,8 +387,16 @@ bool conditionMatches(kj::StringPtr cond, bool forImport) {
   if (cond == "node-addons"_kj) return true;
   // We explicitly do NOT honor "browser" -- we want the node/default build (Vite's deps ship
   // browser builds that pull in browser-only globals).
-  if (cond == "import"_kj || cond == "module"_kj || cond == "module-sync"_kj) return forImport;
+  if (cond == "import"_kj) return forImport;
   if (cond == "require"_kj) return !forImport;
+  // Deliberately do NOT honor "module" / "module-sync". These are bundler-targeted conditions
+  // (webpack/esbuild) that frequently point at *.js ESM-bundler output which is NOT directly
+  // loadable by a real module loader (it mixes import/export with require()/exports., so our
+  // .js CJS-vs-ESM classifier mis-detects it as CJS and compilation fails with "Cannot use import
+  // statement outside a module"). Node's own resolver does not treat "module" as a standard import
+  // condition. Skipping them makes packages like @emnapi/core resolve via their "import": "*.mjs"
+  // entry (unambiguously ESM) -- matching the proven enhanced-resolve config used by the harness
+  // (conditionNames: ["node","import","default"]).
   // Vite uses a "development" / "production" split for some deps; prefer development (it has the
   // full, unminified resolver paths and is what `vite` runs under by default).
   if (cond == "development"_kj) return true;
