@@ -846,8 +846,19 @@ ModFormat classify(jsg::Lock& js, Directory& tmpDir, kj::StringPtr filePath, kj:
   // Heuristic: ESM if it has top-level import/export and no obvious CommonJS exports.
   bool looksEsm = src.contains("export "_kj) || src.contains("export{"_kj) ||
       src.contains("export*"_kj) || src.contains("import "_kj) || src.contains("import{"_kj);
+  // CommonJS signals. Besides the obvious `module.exports` / `exports.foo` / `require(`,
+  // Babel- and TypeScript-transpiled CJS marks itself with
+  // `Object.defineProperty(exports, "__esModule", { value: true })` and assigns named
+  // exports via `Object.defineProperty(exports, "name", …)` — i.e. it touches the `exports`
+  // free variable WITHOUT ever writing `exports.foo` or `module.exports`. Such files
+  // (e.g. tailwindcss/lib/lib/collapseAdjacentRules.js) have no `require(` either, so the
+  // old heuristic missed them; worse, the string `import ` can appear inside a comment
+  // (`@import url(…)`), which flipped looksEsm to true and mis-loaded the module as ESM
+  // ("exports is not defined" at eval). Treat the transpiled-CJS markers as CJS signals.
   bool looksCjs = src.contains("module.exports"_kj) || src.contains("exports."_kj) ||
-      src.contains("require("_kj);
+      src.contains("require("_kj) || src.contains("__esModule"_kj) ||
+      src.contains("Object.defineProperty(exports"_kj) ||
+      src.contains("Object.defineProperty(module.exports"_kj);
   if (looksEsm && !looksCjs) return ModFormat::ESM;
   return ModFormat::CJS;
 }
