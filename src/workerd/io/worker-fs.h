@@ -604,6 +604,12 @@ class VirtualFileSystem {
     // Open the file descriptor for appending. Ignored if write is false.
     bool append = false;
 
+    // If true, and the file already exists, truncate it to zero length on open
+    // (the O_TRUNC flag). Ignored if write is false or append is true. This is
+    // essential for the `'w'` open flag: writing a shorter file over a longer
+    // pre-existing one must not leave stale trailing bytes.
+    bool truncate = false;
+
     // If true, opening the path will fail if it already exists.
     bool exclusive = false;
 
@@ -661,7 +667,12 @@ class VirtualFileSystem {
   // If the file cannot be opened or created, an exception will be thrown.
   virtual kj::OneOf<FsError, kj::Rc<OpenedFile>> openFd(jsg::Lock& js,
       const jsg::Url& url,
-      OpenOptions options = {true, false, false, false, true}) const KJ_WARN_UNUSED_RESULT = 0;
+      OpenOptions options = {.read = true,
+        .write = false,
+        .append = false,
+        .truncate = false,
+        .exclusive = false,
+        .followLinks = true}) const KJ_WARN_UNUSED_RESULT = 0;
 
   // Closes the given file descriptor. This is a no-op if the file descriptor is not open.
   // Using an int fd is not super nice but it is the most compatible with the node:fs

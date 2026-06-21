@@ -39,6 +39,7 @@ export function open(
     read: boolean;
     write: boolean;
     append: boolean;
+    truncate: boolean;
     exclusive: boolean;
     followSymlinks: boolean;
   }

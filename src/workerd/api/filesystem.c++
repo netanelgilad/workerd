@@ -471,6 +471,7 @@ int FileSystemModule::open(jsg::Lock& js, FilePath path, OpenOptions options) {
                         .read = options.read,
                         .write = options.write,
                         .append = options.append,
+                        .truncate = options.truncate,
                         .exclusive = options.exclusive,
                         .followLinks = options.followSymlinks,
                       })) {

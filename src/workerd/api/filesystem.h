@@ -88,11 +88,14 @@ class FileSystemModule final: public jsg::Object {
     bool write;
     // File is opened in append mode. Ignored if write is false.
     bool append;
+    // If the truncate option is set (O_TRUNC), an existing file is reset to zero
+    // length on open. Ignored if write is false or append is true.
+    bool truncate = false;
     // If the exclusive option is set, throw if the file already exists.
     bool exclusive;
     // If the followSymlinks option is set, follow symbolic links.
     bool followSymlinks = true;
-    JSG_STRUCT(read, write, append, exclusive, followSymlinks);
+    JSG_STRUCT(read, write, append, truncate, exclusive, followSymlinks);
   };
 
   int open(jsg::Lock& js, FilePath path, OpenOptions options);

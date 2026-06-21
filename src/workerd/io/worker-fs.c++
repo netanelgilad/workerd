@@ -997,6 +997,17 @@ class VirtualFileSystemImpl final: public VirtualFileSystem {
           if (opts.write) {
             auto stat = file->stat(js);
             if (!stat.writable) return FsError::NOT_PERMITTED;
+            // Honor the O_TRUNC flag: when opening an existing file for writing
+            // (and not appending), reset it to zero length. Without this, writing
+            // a shorter payload over a longer pre-existing file (e.g. tar
+            // re-extracting a path, or two packages writing the same path) leaves
+            // stale trailing bytes -- producing a corrupt, over-long file whose
+            // head and tail are correct but whose middle is garbage.
+            if (opts.truncate && !opts.append && stat.size > 0) {
+              KJ_IF_SOME(err, file->resize(js, 0)) {
+                return err;
+              }
+            }
           }
           KJ_DASSERT(openedFiles.find(nextFd) == kj::none);
           KJ_DEFER(observer->onOpen(openedFiles.size(), nextFd));

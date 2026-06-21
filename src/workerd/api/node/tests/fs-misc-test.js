@@ -27,6 +27,9 @@ import {
   X_OK,
   writeFileSync,
   writeSync,
+  readFileSync,
+  unlinkSync,
+  statSync,
 } from 'node:fs';
 
 strictEqual(typeof openSync, 'function');
@@ -170,6 +173,77 @@ export const pathLimitTest = {
     throws(() => openSync(tooManySegments, 'r'), {
       message: /File path has too many segments/,
     });
+  },
+};
+
+// Regression test for the O_TRUNC ('w' flag) handling in openSync. Opening an
+// existing file for writing with 'w' must truncate it to zero length first;
+// otherwise writing a SHORTER payload over a LONGER pre-existing file leaves
+// stale trailing bytes, producing a corrupt over-long file whose head and tail
+// are correct but whose middle/tail is garbage. This is exactly the corruption
+// that broke VFS module loading at scale (tar re-extracting a module path,
+// emitting a file ~2x its real size). A minimal "many modules where one gets
+// truncated" repro: write N files long, then rewrite each shorter with 'w'.
+export const truncateOnOpenTest = {
+  test() {
+    const path = '/tmp/trunc-on-open.mjs';
+    const long = 'X'.repeat(11640); // mimic the corrupt 11640-byte filter-index
+    const short = 'Y'.repeat(6136); // the real 6136-byte source
+
+    // First write: a long file.
+    let fd = openSync(path, 'w');
+    writeSync(fd, Buffer.from(long), 0, long.length, 0);
+    closeSync(fd);
+    strictEqual(statSync(path).size, long.length);
+
+    // Reopen with 'w' and write a SHORTER payload. O_TRUNC must reset to 0,
+    // so the result is exactly `short` with no stale tail from `long`.
+    fd = openSync(path, 'w');
+    writeSync(fd, Buffer.from(short), 0, short.length, 0);
+    closeSync(fd);
+
+    strictEqual(statSync(path).size, short.length);
+    const got = readFileSync(path, 'utf8');
+    strictEqual(got.length, short.length);
+    strictEqual(got, short);
+
+    // writeFileSync (whole-file replace) must also truncate.
+    writeFileSync(path, long);
+    strictEqual(statSync(path).size, long.length);
+    writeFileSync(path, short);
+    strictEqual(statSync(path).size, short.length);
+    strictEqual(readFileSync(path, 'utf8'), short);
+
+    // Many-files variant: one of many co-written files gets rewritten shorter
+    // and must not retain stale bytes.
+    const N = 50;
+    for (let i = 0; i < N; i++) {
+      writeFileSync(`/tmp/m${i}.txt`, 'A'.repeat(2000 + i));
+    }
+    // Rewrite #37 with a much shorter body via the 'w' open path.
+    const victim = '/tmp/m37.txt';
+    const fd2 = openSync(victim, 'w');
+    writeSync(fd2, Buffer.from('tiny'), 0, 4, 0);
+    closeSync(fd2);
+    strictEqual(statSync(victim).size, 4);
+    strictEqual(readFileSync(victim, 'utf8'), 'tiny');
+
+    // 'a' (append) must NOT truncate.
+    writeFileSync(path, 'AAA');
+    const fdA = openSync(path, 'a');
+    writeSync(fdA, Buffer.from('BBB'), 0, 3);
+    closeSync(fdA);
+    strictEqual(readFileSync(path, 'utf8'), 'AAABBB');
+
+    // 'r+' must NOT truncate (it overwrites in place but preserves length).
+    writeFileSync(path, 'hello world');
+    const fdR = openSync(path, 'r+');
+    writeSync(fdR, Buffer.from('HELLO'), 0, 5, 0);
+    closeSync(fdR);
+    strictEqual(readFileSync(path, 'utf8'), 'HELLO world');
+
+    unlinkSync(path);
+    for (let i = 0; i < N; i++) unlinkSync(`/tmp/m${i}.txt`);
   },
 };
 
