@@ -896,11 +896,20 @@ void FileSystemModule::renameOrCopy(
                 }
               }
             }
-            KJ_CASE_ONEOF(dir, kj::Rc<workerd::Directory>) {
+            KJ_CASE_ONEOF(srcDir, kj::Rc<workerd::Directory>) {
               if (options.copy) {
                 node::THROW_ERR_UV_EISDIR(js, opName);
               }
-              KJ_IF_SOME(err, dir->add(js, relative.name, dir.addRef())) {
+              // NB: bind the source node as `srcDir`, NOT `dir`. The enclosing
+              // KJ_CASE_ONEOF at the top of renameOrCopy already binds the *destination
+              // parent* directory as `dir`; reusing the name `dir` here (as the old code
+              // did) shadowed it, so `dir->add(name, dir.addRef())` added the source
+              // directory into ITSELF instead of into the destination parent. The source
+              // was then removed, so a directory rename silently dropped all its contents
+              // (observed as vite's dep-optimizer producing an empty .vite/deps after it
+              // commits via renameSync(deps_temp, deps)). Add the source node to the
+              // destination parent `dir`.
+              KJ_IF_SOME(err, dir->add(js, relative.name, srcDir.addRef())) {
                 throwFsError(js, err, opName);
               }
             }
@@ -1090,7 +1099,10 @@ jsg::Optional<kj::String> FileSystemModule::mkdir(
 }
 
 void FileSystemModule::rm(jsg::Lock& js, FilePath path, RmOptions options) {
-  // TODO(node-fs): Implement the force option.
+  // The `force` option (Node semantics): exceptions for a non-existent path are ignored.
+  // This matters because Node code routinely calls rm/rmSync(p, {force:true}) to "ensure
+  // gone" — e.g. vite's dep optimizer (loadCachedDepOptimizationMetadata, commit temp-dir
+  // cleanup). Without honoring force, those threw ENOENT and aborted the optimizer.
   auto& vfs = workerd::VirtualFileSystem::current(js);
   NormalizedFilePath normalizedPath(kj::mv(path));
   const jsg::Url& url = normalizedPath;
@@ -1118,14 +1130,20 @@ void FileSystemModule::rm(jsg::Lock& js, FilePath path, RmOptions options) {
               throwFsError(js, err, "rm"_kj);
             }
           }
-        } else {
+        } else if (!options.force) {
           node::THROW_ERR_UV_ENOENT(js, "rm"_kj, nullptr, relative.name);
+        } else {
+          return;  // force: target absent, nothing to remove.
         }
       }
 
       KJ_SWITCH_ONEOF(dir->remove(js, name, {.recursive = options.recursive})) {
         KJ_CASE_ONEOF(res, bool) {
-          // Ignore the return.
+          // `res` is false when the entry did not exist. Node's rm without `force` throws
+          // ENOENT in that case; with `force` it is a no-op.
+          if (!res && !options.force) {
+            node::THROW_ERR_UV_ENOENT(js, "rm"_kj, nullptr, relative.name);
+          }
         }
         KJ_CASE_ONEOF(err, workerd::FsError) {
           throwFsError(js, err, "rm"_kj, relative.name);
@@ -1134,9 +1152,10 @@ void FileSystemModule::rm(jsg::Lock& js, FilePath path, RmOptions options) {
     } else {
       node::THROW_ERR_UV_ENOTDIR(js, "rm"_kj, nullptr, relative.name);
     }
-  } else {
+  } else if (!options.force) {
     node::THROW_ERR_UV_ENOENT(js, "rm"_kj, nullptr, relative.name);
   }
+  // else: force + missing parent dir -> nothing to remove, succeed silently.
 }
 
 namespace {
