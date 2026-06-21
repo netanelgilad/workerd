@@ -250,6 +250,7 @@ v8::MaybeLocal<v8::Promise> dynamicImportCallback(v8::Local<v8::Context> context
     v8::Local<v8::String> specifier,
     v8::Local<v8::FixedArray> import_attributes);
 
+
 kj::Maybe<kj::OneOf<kj::String, ModuleRegistry::ModuleInfo>> tryResolveFromFallbackService(Lock& js,
     const kj::Path& specifier,
     kj::Maybe<const kj::Path&>& referrer,
@@ -270,7 +271,43 @@ class ModuleRegistryImpl final: public ModuleRegistry {
     jsg::setAlignedPointerInEmbedderData(
         context, jsg::ContextPointerSlot::MODULE_REGISTRY, registry.get());
     isolate->SetHostImportModuleDynamicallyCallback(dynamicImportCallback<TypeWrapper>);
+    // FORK-ONLY (vfs-module-loading): give legacy-registry ESM modules a correct
+    // `import.meta.url`. The legacy registry never registered an import.meta initializer,
+    // so import.meta.url was `undefined` — fatal for real npm packages resolved from the
+    // shared /tmp via the VFS module fallback (they call fileURLToPath(import.meta.url),
+    // createRequire(import.meta.url), new URL("./x", import.meta.url) at load time). The
+    // module's registry name IS its root-relative /tmp path, so we expose it as a file://
+    // URL. This makes the post-install `import.meta.url` source rewrite unnecessary.
+    isolate->SetHostInitializeImportMetaObjectCallback(&importMetaCallback);
     return kj::mv(registry);
+  }
+
+  // FORK-ONLY (vfs-module-loading). See `install()`. Plain function (v8 wants a raw
+  // function pointer); recovers the registry + module name through the embedder data.
+  // Uses raw v8 string APIs (not js.str/js.strIntern) because JsString is an incomplete
+  // type in this header.
+  static void importMetaCallback(
+      v8::Local<v8::Context> context, v8::Local<v8::Module> module, v8::Local<v8::Object> meta) {
+    auto& lock = Lock::current();
+    auto* isolate = lock.v8Isolate;
+    auto maybeRegistry = jsg::getAlignedPointerFromEmbedderData<ModuleRegistryImpl<TypeWrapper>>(
+        context, jsg::ContextPointerSlot::MODULE_REGISTRY);
+    KJ_IF_SOME(registry, maybeRegistry) {
+    KJ_IF_SOME(ref, registry.resolve(lock, module)) {
+      // The registry specifier is a root-relative kj::Path (no leading slash, "/"-joined);
+      // the VFS resolver roots everything at /tmp, so the absolute path is "/" + specifier.
+      auto href = kj::str("file:///", ref.specifier.toString());
+      v8::Local<v8::String> key;
+      v8::Local<v8::String> val;
+      if (!v8::String::NewFromUtf8(isolate, "url").ToLocal(&key)) return;
+      if (!v8::String::NewFromUtf8(isolate, href.cStr(), v8::NewStringType::kNormal,
+              static_cast<int>(href.size()))
+              .ToLocal(&val)) {
+        return;
+      }
+      (void)meta->CreateDataProperty(context, key, val);
+    }
+    }
   }
 
   static inline ModuleRegistryImpl* from(jsg::Lock& js) {

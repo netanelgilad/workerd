@@ -959,6 +959,51 @@ jsg::Optional<kj::String> FileSystemModule::mkdir(
   NormalizedFilePath normalizedPath(kj::mv(path));
   const jsg::Url& url = normalizedPath;
 
+  // FORK-ONLY (vfs-module-loading): mkdtemp(prefix) lowers to mkdir(prefix, {tmp:true}) and
+  // ALWAYS creates a fresh uniquely-named directory -- the prefix itself is expected to exist.
+  // Node accepts a prefix ending in a path separator (e.g. npm's @npmcli/fs withTempDir does
+  // mkdtemp(join(`${root}${sep}`, "")) = ".../tmp/"), which `file:`-tarball installs rely on.
+  // Path normalization collapses that trailing slash to the existing prefix dir, so the
+  // "already exists" check below would return kj::none and the JS layer would (wrongly) treat
+  // that undefined as EINVAL. For tmp creation, resolve the prefix dir directly and add a
+  // uniquely-named child inside it.
+  if (options.tmp) {
+    KJ_IF_SOME(node, vfs.resolve(js, url, {.followLinks = false})) {
+      KJ_SWITCH_ONEOF(node) {
+        KJ_CASE_ONEOF(dir, kj::Rc<workerd::Directory>) {
+          auto stat = dir->stat(js);
+          if (!stat.writable) {
+            node::THROW_ERR_UV_EPERM(js, "mkdir"_kj);
+          }
+          if (tmpFileCounter >= kMax) {
+            node::THROW_ERR_UV_EPERM(js, "mkdir"_kj, "Too many temporary directories created"_kj);
+          }
+          auto name = kj::str("tmp-", tmpFileCounter++);
+          auto newDir = workerd::Directory::newWritable(js);
+          KJ_IF_SOME(err, dir->add(js, name, kj::mv(newDir))) {
+            throwFsError(js, err, "mkdir"_kj);
+          }
+          auto basePath = kj::str(url.getPathname());
+          if (!basePath.endsWith("/")) basePath = kj::str(basePath, "/");
+          return kj::str(basePath, name);
+        }
+        KJ_CASE_ONEOF(file, kj::Rc<workerd::File>) {
+          node::THROW_ERR_UV_ENOTDIR(js, "mkdir"_kj);
+        }
+        KJ_CASE_ONEOF(link, kj::Rc<workerd::SymbolicLink>) {
+          node::THROW_ERR_UV_ENOTDIR(js, "mkdir"_kj);
+        }
+        KJ_CASE_ONEOF(err, workerd::FsError) {
+          throwFsError(js, err, "mkdir"_kj);
+        }
+      }
+      KJ_UNREACHABLE;
+    }
+    // Prefix dir doesn't exist as-is; fall through to the relative-name path below, which
+    // creates the temp dir from the basename + counter (the original behavior for a prefix
+    // that does not end in a separator).
+  }
+
   // The path must not already exist. However, if the path is a directory, we
   // will just return rather than throwing an error.
   KJ_IF_SOME(node, vfs.resolve(js, url, {.followLinks = false})) {
@@ -1075,7 +1120,17 @@ jsg::Optional<kj::String> FileSystemModule::mkdir(
             // new directory.
             return kj::str(newUrl.getPathname());
           } else {
-            node::THROW_ERR_UV_EINVAL(js, "mkdir"_kj, "Invalid name for temporary directory"_kj);
+            // FORK-ONLY (vfs-module-loading): Node's mkdtemp(prefix) accepts a prefix that
+            // ends in a path separator (empty basename) -- npm's @npmcli/fs withTempDir calls
+            // mkdtemp(join(`${root}${sep}`, "")), i.e. ".../tmp/", which is exactly how a
+            // `file:`-tarball install fetches its manifest. In that case `relative.base` is the
+            // full prefix dir and `relative.name` is "", so `relative.base.resolve(name)` can
+            // fail to produce a URL even though the directory WAS created. Fall back to building
+            // the pathname from the URL's own pathname + the generated name so the install path
+            // works instead of throwing EINVAL.
+            auto basePath = kj::str(url.getPathname());
+            if (!basePath.endsWith("/")) basePath = kj::str(basePath, "/");
+            return kj::str(basePath, name);
           }
         }
 
