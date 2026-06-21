@@ -844,8 +844,21 @@ export function read<T extends NodeJS.ArrayBufferView>(
       } else {
         actualLength = lengthOrCallback ?? actualBuffer.byteLength;
 
-        validateUint32(position, 'position');
-        actualPosition = position;
+        // Node treats an explicit `null`/`undefined` position the same as a
+        // missing position: read from the file's current position. Without this
+        // normalization, `validateUint32(null|undefined)` throws SYNCHRONOUSLY
+        // here, before the completion callback is ever scheduled. fs-minipass's
+        // ReadStream (used by cacache.get.stream.byDigest, i.e. every npm tarball
+        // read during `npm install`) calls `fs.read(fd, buf, 0, len, null, cb)`,
+        // so the dropped callback stalled the read stream — it never emitted
+        // 'end', and tar extraction (hence Arborist.reify) hung forever. This
+        // mirrors the identical fix already applied to writev() for tar/fs-minipass.
+        if (position == null) {
+          actualPosition = null;
+        } else {
+          validateUint32(position, 'position');
+          actualPosition = position;
+        }
 
         actualCallback = callback;
       }
