@@ -764,6 +764,19 @@ kj::Maybe<kj::String> nodeResolve(jsg::Lock& js,
     kj::StringPtr rawSpec,
     kj::Maybe<kj::StringPtr> referrerPath,
     jsg::ModuleRegistry::ResolveMethod method) {
+  // A `file://` URL specifier is an ABSOLUTE path, not a bare/relative one. Node (and
+  // vite, which loads a bundled config via `import(pathToFileURL(tempFile).href)`) emits
+  // these. Strip the scheme + leading slashes down to the absolute VFS path so it resolves
+  // against /tmp instead of being treated as a bare specifier joined to the referrer.
+  kj::String fileUrlBuf;
+  if (rawSpec.startsWith("file:")) {
+    auto rest = rawSpec.slice(5);
+    size_t i = 0;
+    while (i < rest.size() && rest[i] == '/') i++;
+    fileUrlBuf = kj::str("/", rest.slice(i));
+    rawSpec = fileUrlBuf;
+  }
+
   // Base directory for relative resolution / node_modules walking.
   kj::String baseDir;
   KJ_IF_SOME(ref, referrerPath) {
