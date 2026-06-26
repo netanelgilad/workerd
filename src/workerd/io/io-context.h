@@ -801,6 +801,10 @@ class IoContext final: public kj::Refcounted, private kj::TaskSet::ErrorHandler 
 
   size_t getTimeoutCount();
 
+  // FORK-ONLY (drain-process): active one-shot timers only (excludes setInterval). Used by
+  // runToQuiescence so a recurring timer (e.g. npm's progress spinner) doesn't block process exit.
+  size_t getNonRepeatingTimeoutCount();
+
   // Access the event loop's current time point. This will remain constant between ticks.
   kj::Date now(IncomingRequest& incomingRequest);
 

@@ -73,6 +73,10 @@ class IoContext::TimeoutManagerImpl final: public TimeoutManager {
     return timeoutsStarted - timeoutsFinished;
   }
 
+  // FORK-ONLY (drain-process): count active one-shot timers only, excluding repeating (setInterval)
+  // timers, which never complete. See TimeoutManager::getNonRepeatingTimeoutCount.
+  size_t getNonRepeatingTimeoutCount() const override;
+
   kj::Maybe<kj::Date> getNextTimeout() const override {
     if (timeoutTimes.size() == 0) {
       return kj::none;
@@ -416,7 +420,11 @@ kj::Promise<void> IoContext::runToQuiescence() {
         // addTask -> `tasks`), and no outstanding wait-until tasks. While any of these is non-empty
         // the fire-and-forget "process" still has work to do, so we keep draining.
         bool ioPending = !tasks.isEmpty();
-        if (!moreWork && !ioPending && getTimeoutCount() == 0 && waitUntilTasks.isEmpty()) {
+        // Only one-shot timers count as outstanding work: a process that is otherwise idle but has
+        // a recurring setInterval (e.g. npm's progress spinner) has effectively finished, and on
+        // real Node such timers are typically unref'd so they don't keep the process alive.
+        if (!moreWork && !ioPending && getNonRepeatingTimeoutCount() == 0 &&
+            waitUntilTasks.isEmpty()) {
           return kj::READY_NOW;
         }
         // Otherwise yield to KJ so async I/O / timers can advance, then pump again. We yield on a
@@ -1021,6 +1029,19 @@ void IoContext::TimeoutManagerImpl::clearTimeout(IoContext& context, TimeoutId t
   timeout->second.cancel();
 }
 
+size_t IoContext::TimeoutManagerImpl::getNonRepeatingTimeoutCount() const {
+  // FORK-ONLY (drain-process): count active, not-yet-canceled one-shot timers. Repeating
+  // (setInterval) timers are excluded because they never reach completion, so the drain-to-exit
+  // model must not treat them as outstanding work.
+  size_t count = 0;
+  for (auto& entry: timeouts) {
+    if (!entry.second.params.repeat && !entry.second.isCanceled) {
+      ++count;
+    }
+  }
+  return count;
+}
+
 TimeoutId IoContext::setTimeoutImpl(
     TimeoutId::Generator& generator, bool repeat, jsg::Function<void()> function, double msDelay) {
   static constexpr int64_t max = 3153600000000;  // Milliseconds in 100 years
@@ -1040,6 +1061,10 @@ void IoContext::clearTimeoutImpl(TimeoutId id) {
 
 size_t IoContext::getTimeoutCount() {
   return timeoutManager->getTimeoutCount();
+}
+
+size_t IoContext::getNonRepeatingTimeoutCount() {
+  return timeoutManager->getNonRepeatingTimeoutCount();
 }
 
 kj::Date IoContext::now(IncomingRequest& incomingRequest) {

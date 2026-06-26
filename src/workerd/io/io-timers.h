@@ -83,6 +83,13 @@ class TimeoutManager {
       IoContext& context, TimeoutId::Generator& generator, TimeoutParameters params) = 0;
   virtual void clearTimeout(IoContext& context, TimeoutId id) = 0;
   virtual size_t getTimeoutCount() const = 0;
+
+  // FORK-ONLY (drain-process): number of active NON-repeating (one-shot) timers. Repeating timers
+  // (setInterval) by definition never "complete", so for the drain-to-process-exit model they must
+  // not be treated as outstanding work (otherwise a process whose only remaining timer is a
+  // recurring progress spinner -- e.g. npm's -- could never reach quiescence). See
+  // IoContext::runToQuiescence.
+  virtual size_t getNonRepeatingTimeoutCount() const = 0;
   virtual kj::Maybe<kj::Date> getNextTimeout() const = 0;
   virtual void cancelAll() = 0;
 };
