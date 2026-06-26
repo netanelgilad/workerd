@@ -1150,6 +1150,9 @@ class IoContext final: public kj::Refcounted, private kj::TaskSet::ErrorHandler 
 
   class PendingEvent;
 
+  // FORK-ONLY (drain-process): per-call state for runToQuiescence(). Defined in io-context.c++.
+  struct DrainState;
+
   kj::Maybe<PendingEvent&> pendingEvent;
   kj::Maybe<kj::Promise<void>> abortFromHangTask;
 

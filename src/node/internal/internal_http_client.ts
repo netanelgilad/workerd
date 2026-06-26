@@ -435,6 +435,17 @@ export class ClientRequest extends OutgoingMessage implements _ClientRequest {
       this.emit('error', error);
     });
 
+    // Clear the request timeout now that the response has arrived. Previously the timeout armed in
+    // `#onFinish()` was only ever cleared by `abort()` or an explicit `setTimeout()`, never on the
+    // success path -- so every completed request leaked a pending timer that lived for the full
+    // `timeout` window (npm's fetch-timeout default is 5 minutes). That stray one-shot timer keeps
+    // the isolate's event loop non-idle, which stalls drain-to-quiescence consumers. We also clear
+    // on the response body's end/close as a backstop. (The timer's purpose -- aborting a stuck
+    // request -- is served once the response is in hand.)
+    this.#resetTimers({ finished: true });
+    incoming.once('end', () => this.#resetTimers({ finished: true }));
+    incoming.once('close', () => this.#resetTimers({ finished: true }));
+
     this.emit('response', incoming);
     // @ts-expect-error TS2540 This is a read-only property.
     this.req = this.#incomingMessage;

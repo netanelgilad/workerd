@@ -381,6 +381,16 @@ kj::Promise<void> IoContext::waitForOutputLocks() {
   }
 }
 
+// FORK-ONLY (drain-process): state carried across runToQuiescence() passes.
+struct IoContext::DrainState {
+  // Number of consecutive idle-looking passes required before declaring quiescence. A small streak
+  // tolerates the brief window between dispatching an awaitIo and its timer/continuation becoming
+  // observable, so we don't prematurely resolve while a fetch is mid-flight.
+  static constexpr uint REQUIRED_IDLE_STREAK = 3;
+  uint prevTaskCount = 0;
+  uint idleStreak = 0;
+};
+
 kj::Promise<void> IoContext::runToQuiescence() {
   // FORK-ONLY (drain-process). See header for the full rationale.
   //
@@ -390,16 +400,20 @@ kj::Promise<void> IoContext::runToQuiescence() {
   // unlike the SuppressIoContextScope pass at the end of runImpl(), so async-I/O continuations
   // started by fire-and-forget top-level code can call IoContext::current() without throwing.
   //
-  // Between passes we yield to the KJ event loop so that awaited I/O and timers can land. For
-  // actor-hosted workers (which dynamic workers loaded for RPC are), setTimeout() registers a
-  // wait-until task, so racing waitUntilTasks.onEmpty() against a short timer both (a) wakes us
-  // promptly when async work completes and (b) re-pumps periodically to catch newly-queued work.
+  // Between passes we yield to the KJ event loop so that awaited I/O and timers can land, then
+  // re-pump. Quiescence is detected by a streak of idle-looking passes (see the predicate below).
 
   auto drainLoop = [this]() -> kj::Promise<void> {
     // A recursive lambda needs an explicit self-reference; capture via a heap kj::Function.
+    // `prevTaskCount`/`idleStreak` are carried across passes (heap so they outlive each Promise).
+    // taskCount() is the cumulative number of addTask() calls; awaitIo (fetch/fs/etc.) routes
+    // through addTask, so a rising count means new async I/O was just dispatched.
+    auto state = kj::heap<DrainState>();
+    state->prevTaskCount = taskCount();
     auto pass = kj::heap<kj::Function<kj::Promise<void>()>>();
     auto& passRef = *pass;
-    passRef = [this, &passRef]() -> kj::Promise<void> {
+    auto& st = *state;
+    passRef = [this, &passRef, &st]() -> kj::Promise<void> {
       // Pump one pass with the IoContext bound. Returns true if V8 reports more message-loop work
       // remains after draining microtasks (i.e. there is synchronous follow-up still to run).
       return run([](Worker::Lock& workerLock) -> bool {
@@ -414,39 +428,46 @@ kj::Promise<void> IoContext::runToQuiescence() {
           js.runMicrotasks();
         }
         return moreWork;
-      }).then([this, &passRef](bool moreWork) -> kj::Promise<void> {
-        // Done when this pass produced no further synchronous work AND nothing async is pending:
-        // no scheduled timers, no in-flight awaitIo work (fetch/fs/etc. are routed through
-        // addTask -> `tasks`), and no outstanding wait-until tasks. While any of these is non-empty
-        // the fire-and-forget "process" still has work to do, so we keep draining.
-        bool ioPending = !tasks.isEmpty();
-        // Only one-shot timers count as outstanding work: a process that is otherwise idle but has
-        // a recurring setInterval (e.g. npm's progress spinner) has effectively finished, and on
-        // real Node such timers are typically unref'd so they don't keep the process alive.
-        if (!moreWork && !ioPending && getNonRepeatingTimeoutCount() == 0 &&
-            waitUntilTasks.isEmpty()) {
-          return kj::READY_NOW;
+      }).then([this, &passRef, &st](bool moreWork) -> kj::Promise<void> {
+        // Detect newly-dispatched async I/O since the last pass via the cumulative addTask counter.
+        uint taskCountNow = taskCount();
+        bool newIo = taskCountNow != st.prevTaskCount;
+        st.prevTaskCount = taskCountNow;
+
+        // We deliberately do NOT gate quiescence on `tasks`/`waitUntilTasks` emptiness: for actor-
+        // hosted dynamic workers (which these are) the entrypoint's own RPC plumbing keeps a
+        // permanent entry in `tasks` (the makeReentryCallback hold-open task) and timers register
+        // `waitUntilTasks` entries tied to the IncomingRequest lifetime, so neither set ever
+        // empties mid-request -- gating on them would never terminate. Instead "busy" is:
+        //   - more synchronous JS work pending (moreWork), or
+        //   - a pending one-shot timer (in-flight fetches arm a per-request timeout in our Node
+        //     HTTP client; repeating setInterval timers are excluded so a progress spinner doesn't
+        //     pin us open), or
+        //   - new async I/O was dispatched since the previous pass (taskCount rose), or
+        //   - async I/O dispatched in a prior pass may still be in flight.
+        // To avoid declaring quiescence during the brief window between dispatching an awaitIo and
+        // its timer/continuation showing up, we require a short streak of consecutive idle-looking
+        // passes (no moreWork, no one-shot timer, no new tasks) before resolving.
+        bool idleLooking = !moreWork && getNonRepeatingTimeoutCount() == 0 && !newIo;
+        if (idleLooking) {
+          if (++st.idleStreak >= DrainState::REQUIRED_IDLE_STREAK) {
+            return kj::READY_NOW;
+          }
+        } else {
+          st.idleStreak = 0;
         }
-        // Otherwise yield to KJ so async I/O / timers can advance, then pump again. We yield on a
-        // short timer: this both paces the re-pump and gives the KJ event loop a turn, during which
-        // the timeout manager's own KJ timer task fires due setTimeout()s (running their JS
-        // callbacks) and any in-flight awaitIo continuations land. We additionally wake early when
-        // all wait-until tasks drain (onEmpty), so we re-pump promptly after async work completes.
-        // Yield primarily on async completion (tasks/wait-until draining) so we re-pump exactly
-        // when there is new work, rather than busy-spinning. The timer is only a slow backstop
-        // (re-pump in case work was queued by a path we don't directly observe), so it is kept
-        // long enough not to starve the KJ event loop driving in-flight socket/file I/O.
-        auto yield = getIoChannelFactory().getTimer().afterLimitTimeout(15 * kj::MILLISECONDS);
-        if (!waitUntilTasks.isEmpty()) {
-          yield = yield.exclusiveJoin(waitUntilTasks.onEmpty());
-        }
-        if (!tasks.isEmpty()) {
-          yield = yield.exclusiveJoin(tasks.onEmpty());
-        }
-        return yield.then([&passRef]() { return passRef(); });
+        // Otherwise yield to the KJ event loop, then pump again. The yield gives KJ a turn so the
+        // timeout manager's timer tasks fire due setTimeout()s (running their JS callbacks) and any
+        // in-flight awaitIo continuations (fetch/fs) land before the next pump. We can't wake on
+        // tasks/waitUntil onEmpty here (they don't empty mid-request for actors), so we pace on a
+        // short timer kept long enough not to starve the socket/file I/O driving those requests.
+        return getIoChannelFactory()
+            .getTimer()
+            .afterLimitTimeout(5 * kj::MILLISECONDS)
+            .then([&passRef]() { return passRef(); });
       });
     };
-    return passRef().attach(kj::mv(pass));
+    return passRef().attach(kj::mv(pass)).attach(kj::mv(state));
   };
 
   // Bound the drain by the limit enforcer's drain budget and cancel on abort, mirroring how
