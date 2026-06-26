@@ -411,16 +411,30 @@ kj::Promise<void> IoContext::runToQuiescence() {
         }
         return moreWork;
       }).then([this, &passRef](bool moreWork) -> kj::Promise<void> {
-        // Done when this pass produced no further synchronous work AND nothing async is pending.
-        if (!moreWork && waitUntilTasks.isEmpty()) {
+        // Done when this pass produced no further synchronous work AND nothing async is pending:
+        // no scheduled timers, no in-flight awaitIo work (fetch/fs/etc. are routed through
+        // addTask -> `tasks`), and no outstanding wait-until tasks. While any of these is non-empty
+        // the fire-and-forget "process" still has work to do, so we keep draining.
+        bool ioPending = !tasks.isEmpty();
+        if (!moreWork && !ioPending && getTimeoutCount() == 0 && waitUntilTasks.isEmpty()) {
           return kj::READY_NOW;
         }
-        // Otherwise yield to KJ so async I/O / timers can advance, then pump again. onEmpty()
-        // wakes us as soon as all currently-pending wait-until tasks finish; the short timer
-        // bounds how long we wait when there is in-flight sync work but an empty wait-until set,
-        // and re-pumps periodically in case new wait-until tasks were queued after onEmpty().
-        auto yield = waitUntilTasks.onEmpty().exclusiveJoin(
-            getIoChannelFactory().getTimer().afterLimitTimeout(1 * kj::MILLISECONDS));
+        // Otherwise yield to KJ so async I/O / timers can advance, then pump again. We yield on a
+        // short timer: this both paces the re-pump and gives the KJ event loop a turn, during which
+        // the timeout manager's own KJ timer task fires due setTimeout()s (running their JS
+        // callbacks) and any in-flight awaitIo continuations land. We additionally wake early when
+        // all wait-until tasks drain (onEmpty), so we re-pump promptly after async work completes.
+        // Yield primarily on async completion (tasks/wait-until draining) so we re-pump exactly
+        // when there is new work, rather than busy-spinning. The timer is only a slow backstop
+        // (re-pump in case work was queued by a path we don't directly observe), so it is kept
+        // long enough not to starve the KJ event loop driving in-flight socket/file I/O.
+        auto yield = getIoChannelFactory().getTimer().afterLimitTimeout(15 * kj::MILLISECONDS);
+        if (!waitUntilTasks.isEmpty()) {
+          yield = yield.exclusiveJoin(waitUntilTasks.onEmpty());
+        }
+        if (!tasks.isEmpty()) {
+          yield = yield.exclusiveJoin(tasks.onEmpty());
+        }
         return yield.then([&passRef]() { return passRef(); });
       });
     };
@@ -1432,9 +1446,22 @@ void IoContext::runImpl(Runnable& runnable,
             v8::Isolate::kFullGarbageCollection);
       }
 
-      // Run FinalizationRegistry cleanup tasks without an IoContext
+      // Run FinalizationRegistry cleanup tasks without an IoContext.
+      //
+      // FORK-ONLY (drain-process): for a `drainProcess`-loaded dynamic worker we deliberately keep
+      // the IoContext bound during this message-loop pump. The whole point of drainProcess is that
+      // the worker runs a fire-and-forget "process" (e.g. npm's npm-cli.js, which calls
+      // `cli(process)` and discards the returned promise). Those discarded async continuations
+      // advance in THIS post-scope pump; if it runs under SuppressIoContextScope (the default), the
+      // first async-I/O hop calls IoContext::current() with threadLocalRequest == nullptr and throws
+      // "Disallowed operation called within global scope". Keeping the context bound lets that work
+      // proceed -- the actual quiescence loop and its limit bounding live in runToQuiescence(),
+      // which the RPC entrypoint awaits, so this only changes the binding, not the drain budget.
       {
-        SuppressIoContextScope noIoCtxt;
+        kj::Maybe<SuppressIoContextScope> noIoCtxt;
+        if (!drainProcess) {
+          noIoCtxt.emplace();
+        }
         while (!gotTermination && js.pumpMsgLoop()) {
           // Check if FinalizationRegistry cleanup callbacks have not breached our limits
           if (limitEnforcer->getLimitsExceeded() != kj::none) {
