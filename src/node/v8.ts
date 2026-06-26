@@ -86,6 +86,12 @@ export function isStringOneByteRepresentation(content: string): boolean {
   throw new ERR_METHOD_NOT_IMPLEMENTED('isStringOneByteRepresentation');
 }
 
+// workerd does not expose live V8 heap statistics, but several npm tools
+// (e.g. npm/Arborist's PackumentCache) read `heap_size_limit` to size an
+// lru-cache. A value of 0 makes lru-cache throw (`maxSize` must be > 0), so we
+// report a sane, non-zero limit (2 GiB) that matches a typical isolate budget.
+const DEFAULT_HEAP_SIZE_LIMIT = 2 * 1024 * 1024 * 1024;
+
 export function getHeapStatistics(): HeapInfo {
   return {
     total_heap_size: 0,
@@ -93,7 +99,7 @@ export function getHeapStatistics(): HeapInfo {
     total_physical_size: 0,
     total_available_size: 0,
     used_heap_size: 0,
-    heap_size_limit: 0,
+    heap_size_limit: DEFAULT_HEAP_SIZE_LIMIT,
     malloced_memory: 0,
     peak_malloced_memory: 0,
     does_zap_garbage: 0,

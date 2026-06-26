@@ -20,7 +20,9 @@ export const v8Test = {
     strictEqual(heapStats.total_physical_size, 0);
     strictEqual(heapStats.total_available_size, 0);
     strictEqual(heapStats.used_heap_size, 0);
-    strictEqual(heapStats.heap_size_limit, 0);
+    // heap_size_limit is reported as a non-zero constant (2 GiB) so that npm
+    // tooling that sizes caches from it does not throw on a 0 limit.
+    strictEqual(heapStats.heap_size_limit, 2 * 1024 * 1024 * 1024);
     strictEqual(heapStats.malloced_memory, 0);
     strictEqual(heapStats.peak_malloced_memory, 0);
     strictEqual(heapStats.does_zap_garbage, 0);
