@@ -3121,7 +3121,10 @@ class Server::WorkerService final: public Service,
       kj::Maybe<kj::Function<void()>> abortIsolateCallback = kj::none,
       // FORK-ONLY (shared-tmp-vfs): parent's /tmp dir to share with this (dynamic) worker's
       // requests, or kj::none for isolated /tmp. SAME-THREAD ONLY.
-      kj::Maybe<kj::Rc<workerd::Directory>> sharedTmpDir = kj::none)
+      kj::Maybe<kj::Rc<workerd::Directory>> sharedTmpDir = kj::none,
+      // FORK-ONLY (drain-process): when true, each request's IoContext is marked so its RPC
+      // entrypoint drains the JS event loop to quiescence before resolving.
+      bool drainProcess = false)
       : channelTokenHandler(channelTokenHandler),
         serviceName(serviceName),
         threadContext(threadContext),
@@ -3138,7 +3141,8 @@ class Server::WorkerService final: public Service,
         containerEgressInterceptorImage(kj::mv(containerEgressInterceptorImageParam)),
         isDynamic(isDynamic),
         abortIsolateCallback(kj::mv(abortIsolateCallback)),
-        sharedTmpDir(kj::mv(sharedTmpDir)) {}
+        sharedTmpDir(kj::mv(sharedTmpDir)),
+        drainProcess(drainProcess) {}
 
   // Call immediately after the constructor to set up `actorNamespaces`. This can't happen during
   // the constructor itself since it sets up cyclic references, which will throw an exception if
@@ -3464,7 +3468,9 @@ class Server::WorkerService final: public Service,
         false,     // isDynamicDispatch
         kj::none,  // accessInfo
         kj::mv(metadata.restoredSelfTokenFactory),
-        kj::mv(requestSharedTmpDir));
+        kj::mv(requestSharedTmpDir),
+        // FORK-ONLY (drain-process): mark this request's IoContext if the worker opted in.
+        drainProcess);
   }
 
  private:
@@ -3671,6 +3677,10 @@ class Server::WorkerService final: public Service,
   // Held here (parent thread, lives as long as the WorkerService / WorkerStubImpl) so the directory
   // outlives any individual child request. SAME-THREAD ONLY -- not thread-safe.
   kj::Maybe<kj::Rc<workerd::Directory>> sharedTmpDir;
+
+  // FORK-ONLY (drain-process): when true, each request's IoContext for this (dynamic) worker is
+  // marked so its RPC entrypoint drains the JS event loop to quiescence before resolving.
+  bool drainProcess = false;
 
   // ---------------------------------------------------------------------------
   // implements kj::TaskSet::ErrorHandler
@@ -4535,6 +4545,11 @@ struct Server::WorkerDef {
   // that resolves modules from the worker's own VFS. See DynamicWorkerSource.vfsModuleFallback.
   bool vfsModuleFallback = false;
 
+  // FORK-ONLY (drain-process): when true, this dynamic worker's RPC entrypoint drains the JS event
+  // loop to quiescence before resolving. Stored on the WorkerService and used to mark each child
+  // request's IoContext. See DynamicWorkerSource.drainProcess.
+  bool drainProcess = false;
+
   // Callback invoked when abortIsolate() is called. Used by dynamic workers to remove
   // themselves from the loader's isolate map.
   kj::Maybe<kj::Function<void()>> abortIsolateCallback;
@@ -4815,6 +4830,9 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
         // FORK-ONLY (vfs-module-loading): carry the opt-in into the WorkerService so makeWorkerImpl
         // installs a VFS-backed module fallback on the child isolate.
         .vfsModuleFallback = source.vfsModuleFallback,
+        // FORK-ONLY (drain-process): carry the opt-in into the WorkerService so each child request's
+        // IoContext is marked to drain to quiescence at the RPC entrypoint.
+        .drainProcess = source.drainProcess,
         // The callback is owned by the WorkerService, which is owned by `this`, so a raw
         // pointer is safe.
         .abortIsolateCallback = kj::Function<void()>([this]() { onAbortIsolate(); }),
@@ -5382,6 +5400,10 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
   // move and can be forwarded to the WorkerService. SAME-THREAD ONLY.
   kj::Maybe<kj::Rc<workerd::Directory>> sharedTmpDir = kj::mv(def.sharedTmpDir);
 
+  // FORK-ONLY (drain-process): same hoist as sharedTmpDir -- read the bool out of `def` before it is
+  // moved into `linkCallback`, so we can forward it to the WorkerService below.
+  bool drainProcess = def.drainProcess;
+
   auto linkCallback = [this, def = kj::mv(def), totalActorChannels](WorkerService& workerService,
                           Worker::ValidationErrorReporter& errorReporter) mutable {
     WorkerService::LinkedIoChannels result;
@@ -5544,7 +5566,9 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
           kj::mv(containerEgressInterceptorImage), def.isDynamic, kj::mv(abortIsolateCallback),
           // FORK-ONLY (shared-tmp-vfs): forward the opt-in shared /tmp dir to the service. Read from
           // the hoisted local (not def.sharedTmpDir, which was moved-from into linkCallback above).
-          kj::mv(sharedTmpDir));
+          kj::mv(sharedTmpDir),
+          // FORK-ONLY (drain-process): forward the opt-in to the service (hoisted local).
+          drainProcess);
   result->initActorNamespaces(def.localActorConfigs, actorNamespacesByUniqueKey, network);
   co_return result;
 }

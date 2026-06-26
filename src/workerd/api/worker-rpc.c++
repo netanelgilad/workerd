@@ -1203,6 +1203,19 @@ class JsRpcTargetBase: public rpc::JsRpcTarget::Server {
         js.throwException(kj::mv(error));
       })));
 
+      // FORK-ONLY (drain-process): if this worker was loaded with WorkerCode.drainProcess, drive
+      // its JS event loop to quiescence WITH the IoContext bound after the entrypoint method's
+      // returned promise has resolved (and its result serialized, above), but before resolving the
+      // RPC. This lets a `drainProcess` child run a fire-and-forget bin (e.g. npm-cli.js, which
+      // calls `cli(process)` and discards the promise) to completion -- so `await stub.run()`
+      // resolves only when the child's "process" has exited. The serialized result is already
+      // committed to `callContext` inside the continuation above, so the drain does not disturb it.
+      // Capturing `&ctx` is safe for the same reason as the output-locks chain below: if `ctx` is
+      // destroyed the trailing .then() is canceled (makeReentryCallback() ensures this).
+      if (ctx.shouldDrainProcess()) {
+        result = result.then([&ctx]() mutable { return ctx.runToQuiescence(); });
+      }
+
       if (ctx.hasOutputGate()) {
         // Note: If `ctx` is destroyed, the entire call to `callImpl()` will be canceled
         // (makeReentryCallback() ensures this). This does NOT cancel the JavaScript (because JS

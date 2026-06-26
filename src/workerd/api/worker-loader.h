@@ -123,6 +123,18 @@ class WorkerLoader: public jsg::Object {
     // Defaults to false (no VFS module loading, upstream behavior).
     jsg::Optional<bool> vfsModuleFallback = false;
 
+    // FORK-ONLY (drain-process): OPT-IN. When true, after this dynamically-loaded worker's RPC
+    // entrypoint method resolves, the runtime drives the child's JavaScript event loop to
+    // quiescence WITH the IoContext bound (see IoContext::runToQuiescence) before resolving the
+    // RPC. This lets the child import a "bin" fire-and-forget -- e.g.
+    // `await import('/tmp/usr/.../npm-cli.js')` after setting process.argv -- and have npm's
+    // discarded top-level promise (`cli(process)`) run its async I/O continuations to completion
+    // instead of advancing only in runImpl's post-scope SuppressIoContextScope pass (where the
+    // first async-I/O hop throws "Disallowed operation called within global scope"). Effectively,
+    // `await stub.getEntrypoint().run()` then resolves only when the child's "process" has exited.
+    // Defaults to false (upstream behavior: the entrypoint promise resolves immediately).
+    jsg::Optional<bool> drainProcess = false;
+
     // TODO(someday): cache API outbound?
 
     JSG_STRUCT(compatibilityDate,
@@ -136,7 +148,8 @@ class WorkerLoader: public jsg::Object {
         tails,
         streamingTails,
         shareParentTmp,
-        vfsModuleFallback);
+        vfsModuleFallback,
+        drainProcess);
   };
 
   jsg::Ref<WorkerStub> get(

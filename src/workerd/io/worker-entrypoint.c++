@@ -67,7 +67,9 @@ class WorkerEntrypoint final: public WorkerInterface {
       kj::Maybe<kj::Own<IoChannelFactory::SelfTokenFactory>> selfTokenFactory,
       // FORK-ONLY (shared-tmp-vfs): optional parent-donated writable /tmp for an opt-in dynamic
       // worker. kj::none = isolated /tmp (default). SAME-THREAD ONLY.
-      kj::Maybe<kj::Rc<Directory>> sharedTmpDir = kj::none);
+      kj::Maybe<kj::Rc<Directory>> sharedTmpDir = kj::none,
+      // FORK-ONLY (drain-process): mark the IoContext so its RPC entrypoint drains to quiescence.
+      bool drainProcess = false);
 
   kj::Promise<void> request(kj::HttpMethod method,
       kj::StringPtr url,
@@ -122,7 +124,9 @@ class WorkerEntrypoint final: public WorkerInterface {
       kj::Maybe<kj::Own<IoChannelFactory::SelfTokenFactory>> selfTokenFactory,
       // FORK-ONLY (shared-tmp-vfs): optional parent-donated writable /tmp for an opt-in dynamic
       // worker. kj::none = isolated /tmp (default). SAME-THREAD ONLY.
-      kj::Maybe<kj::Rc<Directory>> sharedTmpDir = kj::none);
+      kj::Maybe<kj::Rc<Directory>> sharedTmpDir = kj::none,
+      // FORK-ONLY (drain-process): mark the IoContext so its RPC entrypoint drains to quiescence.
+      bool drainProcess = false);
 
   kj::Promise<void> requestImpl(kj::HttpMethod method,
       kj::StringPtr url,
@@ -212,7 +216,8 @@ kj::Own<WorkerInterface> WorkerEntrypoint::construct(ThreadContext& threadContex
     bool isDynamicDispatch,
     kj::Maybe<kj::Own<AccessInfo>> accessInfo,
     kj::Maybe<kj::Own<IoChannelFactory::SelfTokenFactory>> selfTokenFactory,
-    kj::Maybe<kj::Rc<Directory>> sharedTmpDir) {
+    kj::Maybe<kj::Rc<Directory>> sharedTmpDir,
+    bool drainProcess) {
   TRACE_EVENT("workerd", "WorkerEntrypoint::construct()");
 
   // Arrange to forcefully cancel work when the Actor is aborted.
@@ -227,7 +232,7 @@ kj::Own<WorkerInterface> WorkerEntrypoint::construct(ThreadContext& threadContex
   obj->init(kj::mv(worker), kj::mv(actor), kj::mv(limitEnforcer), kj::mv(ioContextDependency),
       kj::mv(ioChannelFactory), kj::addRef(*metrics), kj::mv(workerTracer),
       kj::mv(maybeTriggerInvocationSpan), kj::mv(accessInfo), kj::mv(selfTokenFactory),
-      kj::mv(sharedTmpDir));
+      kj::mv(sharedTmpDir), drainProcess);
   auto& wrapper = metrics->wrapWorkerInterface(*obj);
   return kj::attachRef(wrapper, kj::mv(obj), kj::mv(metrics));
 }
@@ -262,7 +267,8 @@ void WorkerEntrypoint::init(kj::Own<const Worker> worker,
     kj::Maybe<tracing::InvocationSpanContext> maybeTriggerInvocationSpan,
     kj::Maybe<kj::Own<AccessInfo>> accessInfo,
     kj::Maybe<kj::Own<IoChannelFactory::SelfTokenFactory>> selfTokenFactory,
-    kj::Maybe<kj::Rc<Directory>> sharedTmpDir) {
+    kj::Maybe<kj::Rc<Directory>> sharedTmpDir,
+    bool drainProcess) {
   TRACE_EVENT("workerd", "WorkerEntrypoint::init()");
   // We need to construct the IoContext -- unless this is an actor and it already has a
   // IoContext, in which case we reuse it.
@@ -283,6 +289,10 @@ void WorkerEntrypoint::init(kj::Own<const Worker> worker,
     // thread-safe and the loaded isolate runs on the parent's thread.
     KJ_IF_SOME(dir, sharedTmpDir) {
       ctx->setSharedTmpDir(kj::mv(dir));
+    }
+    // FORK-ONLY (drain-process): mark the context so its RPC entrypoint drains to quiescence.
+    if (drainProcess) {
+      ctx->setDrainProcess(true);
     }
     return ctx.attachToThisReference(kj::mv(ioContextDependency));
   };
@@ -1024,13 +1034,14 @@ kj::Own<WorkerInterface> newWorkerEntrypoint(ThreadContext& threadContext,
     bool isDynamicDispatch,
     kj::Maybe<kj::Own<AccessInfo>> accessInfo,
     kj::Maybe<kj::Own<IoChannelFactory::SelfTokenFactory>> selfTokenFactory,
-    kj::Maybe<kj::Rc<Directory>> sharedTmpDir) {
+    kj::Maybe<kj::Rc<Directory>> sharedTmpDir,
+    bool drainProcess) {
   return WorkerEntrypoint::construct(threadContext, kj::mv(worker), kj::mv(entrypointName),
       kj::mv(props), kj::mv(actor), kj::mv(limitEnforcer), kj::mv(ioContextDependency),
       kj::mv(ioChannelFactory), kj::mv(metrics), waitUntilTasks, tunnelExceptions,
       kj::mv(workerTracer), kj::mv(cfBlobJson), kj::mv(versionInfo),
       kj::mv(maybeTriggerInvocationSpan), isDynamicDispatch, kj::mv(accessInfo),
-      kj::mv(selfTokenFactory), kj::mv(sharedTmpDir));
+      kj::mv(selfTokenFactory), kj::mv(sharedTmpDir), drainProcess);
 }
 
 }  // namespace workerd

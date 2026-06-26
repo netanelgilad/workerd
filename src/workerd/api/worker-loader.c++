@@ -225,6 +225,9 @@ DynamicWorkerSource WorkerLoader::toDynamicWorkerSource(jsg::Lock& js,
     // FORK-ONLY (vfs-module-loading): forward the opt-in so the child isolate gets a VFS-backed
     // module fallback. See WorkerCode.vfsModuleFallback.
     .vfsModuleFallback = code.vfsModuleFallback.orDefault(false),
+    // FORK-ONLY (drain-process): forward the opt-in so the child's RPC entrypoint drains the JS
+    // event loop to quiescence before resolving. See WorkerCode.drainProcess.
+    .drainProcess = code.drainProcess.orDefault(false),
     .ownContent = ownCompatFlags.attach(kj::mv(code.modules), kj::mv(code.mainModule)),
     .ownContentIsRpcResponse = false};
 }

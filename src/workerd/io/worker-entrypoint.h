@@ -58,6 +58,10 @@ kj::Own<WorkerInterface> newWorkerEntrypoint(ThreadContext& threadContext,
     // directory (donated by the parent worker that loaded this dynamic isolate) instead of getting
     // a private one. kj::none = isolated /tmp (default). SAME-THREAD ONLY -- the directory is not
     // thread-safe; only used for same-thread dynamic workers.
-    kj::Maybe<kj::Rc<Directory>> sharedTmpDir = kj::none);
+    kj::Maybe<kj::Rc<Directory>> sharedTmpDir = kj::none,
+    // FORK-ONLY (drain-process): if true, this request's IoContext is marked so its RPC entrypoint
+    // drains the JS event loop to quiescence before resolving (runs a fire-and-forget bin to
+    // completion). Defaults to false (upstream behavior). See WorkerCode.drainProcess.
+    bool drainProcess = false);
 
 }  // namespace workerd

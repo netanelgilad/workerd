@@ -377,6 +377,63 @@ kj::Promise<void> IoContext::waitForOutputLocks() {
   }
 }
 
+kj::Promise<void> IoContext::runToQuiescence() {
+  // FORK-ONLY (drain-process). See header for the full rationale.
+  //
+  // We drive the loop with a recursive helper. Each "pass" re-enters this IoContext (acquiring the
+  // isolate lock and binding the context to the thread) and pumps both the microtask queue and
+  // V8's message loop. Crucially this happens WITH the context bound (threadLocalRequest == this),
+  // unlike the SuppressIoContextScope pass at the end of runImpl(), so async-I/O continuations
+  // started by fire-and-forget top-level code can call IoContext::current() without throwing.
+  //
+  // Between passes we yield to the KJ event loop so that awaited I/O and timers can land. For
+  // actor-hosted workers (which dynamic workers loaded for RPC are), setTimeout() registers a
+  // wait-until task, so racing waitUntilTasks.onEmpty() against a short timer both (a) wakes us
+  // promptly when async work completes and (b) re-pumps periodically to catch newly-queued work.
+
+  auto drainLoop = [this]() -> kj::Promise<void> {
+    // A recursive lambda needs an explicit self-reference; capture via a heap kj::Function.
+    auto pass = kj::heap<kj::Function<kj::Promise<void>()>>();
+    auto& passRef = *pass;
+    passRef = [this, &passRef]() -> kj::Promise<void> {
+      // Pump one pass with the IoContext bound. Returns true if V8 reports more message-loop work
+      // remains after draining microtasks (i.e. there is synchronous follow-up still to run).
+      return run([](Worker::Lock& workerLock) -> bool {
+        jsg::Lock& js = workerLock;
+        bool moreWork = false;
+        // Drain microtasks, then pump the message loop until V8 says there's nothing left. Each
+        // pumpMsgLoop() iteration may enqueue microtasks (timer/promise callbacks), so re-run
+        // microtasks after every pump.
+        js.runMicrotasks();
+        while (js.pumpMsgLoop()) {
+          moreWork = true;
+          js.runMicrotasks();
+        }
+        return moreWork;
+      }).then([this, &passRef](bool moreWork) -> kj::Promise<void> {
+        // Done when this pass produced no further synchronous work AND nothing async is pending.
+        if (!moreWork && waitUntilTasks.isEmpty()) {
+          return kj::READY_NOW;
+        }
+        // Otherwise yield to KJ so async I/O / timers can advance, then pump again. onEmpty()
+        // wakes us as soon as all currently-pending wait-until tasks finish; the short timer
+        // bounds how long we wait when there is in-flight sync work but an empty wait-until set,
+        // and re-pumps periodically in case new wait-until tasks were queued after onEmpty().
+        auto yield = waitUntilTasks.onEmpty().exclusiveJoin(
+            getIoChannelFactory().getTimer().afterLimitTimeout(1 * kj::MILLISECONDS));
+        return yield.then([&passRef]() { return passRef(); });
+      });
+    };
+    return passRef().attach(kj::mv(pass));
+  };
+
+  // Bound the drain by the limit enforcer's drain budget and cancel on abort, mirroring how
+  // IncomingRequest::drain() bounds background work.
+  return drainLoop()
+      .exclusiveJoin(limitEnforcer->limitDrain())
+      .exclusiveJoin(onAbort().catch_([](kj::Exception&&) {}));
+}
+
 bool IoContext::hasOutputGate() {
   return actor != kj::none;
 }

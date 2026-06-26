@@ -693,6 +693,25 @@ class IoContext final: public kj::Refcounted, private kj::TaskSet::ErrorHandler 
     return waitUntilStatusValue;
   }
 
+  // FORK-ONLY (drain-process): drive this IoContext's JavaScript event loop to quiescence WITH
+  // the IoContext bound to the thread, so that "fire-and-forget" top-level async work (e.g. a bin
+  // that calls `cli(process)` and discards the returned promise -- like npm's npm-cli.js) can run
+  // its async continuations to completion instead of advancing only in runImpl's post-scope
+  // SuppressIoContextScope pass (where threadLocalRequest == nullptr and the first async-I/O hop
+  // throws "Disallowed operation called within global scope").
+  //
+  // Each pass re-enters the context via run() and pumps both the microtask queue and V8's message
+  // loop with the context bound. Between passes it yields to the KJ event loop -- racing
+  // waitUntilTasks.onEmpty() against a short timer -- so awaited I/O continuations and timers
+  // (npm's setTimeouts register as wait-until tasks for actors) can make progress before the next
+  // pump. It resolves when V8 reports no remaining message-loop work AND there are no outstanding
+  // wait-until tasks. Bounded by the limit enforcer's drain budget and cancelled on abort.
+  //
+  // This is intended to be chained after a `drainProcess`-loaded dynamic worker's RPC entrypoint
+  // promise resolves, so `await stub.run()` resolves only when the child's event loop is idle --
+  // i.e. when its "process" has exited.
+  kj::Promise<void> runToQuiescence();
+
   // DO NOT USE, use `addWaitUntil()` instead.
   kj::TaskSet& getWaitUntilTasks() {
     // TODO(cleanup): This is only needed for use with RpcWorkerInterface, but we can eliminate
@@ -814,6 +833,15 @@ class IoContext final: public kj::Refcounted, private kj::TaskSet::ErrorHandler 
   // isolates run on the same thread as their parent.
   void setSharedTmpDir(kj::Rc<Directory> dir) {
     sharedTmpDir = kj::mv(dir);
+  }
+
+  // FORK-ONLY (drain-process): mark this IoContext as belonging to a `drainProcess`-loaded dynamic
+  // worker, so its RPC entrypoint drains the JS event loop to quiescence before resolving.
+  void setDrainProcess(bool value) {
+    drainProcess = value;
+  }
+  bool shouldDrainProcess() const {
+    return drainProcess;
   }
 
   // Returns a promise that resolves once `now() >= when`.
@@ -1082,6 +1110,11 @@ class IoContext final: public kj::Refcounted, private kj::TaskSet::ErrorHandler 
   // donated the directory (the parent isolate that loaded it). kj::none = default isolated /tmp.
   // SAME-THREAD ONLY. See setSharedTmpDir().
   kj::Maybe<kj::Rc<Directory>> sharedTmpDir;
+
+  // FORK-ONLY (drain-process): when true, this IoContext belongs to a dynamic worker that was
+  // loaded with WorkerCode.drainProcess, so its RPC entrypoint should drain the JS event loop to
+  // quiescence (runToQuiescence) before resolving. See setDrainProcess()/shouldDrainProcess().
+  bool drainProcess = false;
 
   kj::Own<const Worker> worker;
   kj::Maybe<Worker::Actor&> actor;

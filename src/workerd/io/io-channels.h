@@ -505,6 +505,12 @@ struct DynamicWorkerSource {
   // useful together with sharedTmpDir so the resolved files come from the parent's /tmp.
   bool vfsModuleFallback = false;
 
+  // FORK-ONLY (drain-process): when true, after this dynamic worker's RPC entrypoint method
+  // resolves, the runtime drains the child's JS event loop to quiescence with the IoContext bound
+  // (IoContext::runToQuiescence) before resolving the RPC. Lets a child run a fire-and-forget bin
+  // (e.g. npm-cli.js) to completion. See WorkerCode.drainProcess.
+  bool drainProcess = false;
+
   // Owns any data structures pointed into by the other members. (E.g. `source` contains a lot of
   // `StringPtr`s; `ownContent` owns the backing buffer for them.)
   kj::Own<void> ownContent;
@@ -534,6 +540,8 @@ struct DynamicWorkerSource {
       .sharedTmpDir = sharedTmpDir.map([](kj::Rc<Directory>& d) { return d.addRef(); }),
       // FORK-ONLY (vfs-module-loading): carry the opt-in through re-loads of the isolate.
       .vfsModuleFallback = vfsModuleFallback,
+      // FORK-ONLY (drain-process): carry the opt-in through re-loads of the isolate.
+      .drainProcess = drainProcess,
       .ownContent = kj::mv(newOwnContent),
       .ownContentIsRpcResponse = ownContentIsRpcResponse,
     };
