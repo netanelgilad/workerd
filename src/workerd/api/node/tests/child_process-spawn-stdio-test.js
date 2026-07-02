@@ -88,6 +88,34 @@ export const stdinEcho = {
   },
 };
 
+// (b2) drainProcess quiescence stays correct with streaming stdin in flight: a child actively
+// reading stdin must NOT be declared quiescent while its stdin is still open (a pending read keeps
+// the "process" alive, exactly like Node). The parent writes one chunk, PAUSES 150ms, then writes
+// a second chunk and closes -- if quiescence were declared during the pause the child would exit
+// early and lose "part2".
+export const stdinKeepsChildAlive = {
+  async test() {
+    const script = writeScript(
+      'stdio_stdin_wait.js',
+      `let buf = "";
+       process.stdin.on("data", (d) => { buf += d.toString(); });
+       process.stdin.on("end", () => { process.stdout.write("GOT:" + buf); process.exit(0); });`
+    );
+    const child = spawn('node', [script]);
+    const readOut = collect(child.stdout);
+    child.stdin.write('part1-');
+    await new Promise((r) => setTimeout(r, 150));
+    child.stdin.write('part2');
+    child.stdin.end();
+    const code = await new Promise((resolve) => child.on('exit', resolve));
+    strictEqual(code, 0);
+    ok(
+      readOut().includes('GOT:part1-part2'),
+      `child must stay alive across the stdin gap and receive both chunks: ${JSON.stringify(readOut())}`
+    );
+  },
+};
+
 // (c) stdio:"inherit" forwards the child's output to the PARENT's process.stdout/stderr (Node's
 // documented semantics: inherit = child writes to the parent's streams). child.stdout is null.
 export const inheritForwarding = {
