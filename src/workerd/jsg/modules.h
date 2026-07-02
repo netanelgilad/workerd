@@ -218,6 +218,18 @@ class ModuleRegistry {
 
   virtual kj::Maybe<ModuleRef> resolve(jsg::Lock& js, v8::Local<v8::Module> module) = 0;
 
+  // FORK-ONLY (require-resolve): resolve `targetPath` exactly as a require() of `rawSpecifier`
+  // from `referrer` would -- same registry lookup, including the module fallback service (the
+  // VFS resolver in Worker-Loader children), extension probing and redirects -- and return the
+  // FINAL registered module path (absolute, e.g. "/tmp/node_modules/x/lib/index.js") WITHOUT
+  // evaluating the module. The target module may be compiled and registered as a side effect
+  // (same as resolve()), but no user code runs. Returns kj::none if the module cannot be
+  // resolved.
+  kj::Maybe<kj::String> resolveRequirePath(jsg::Lock& js,
+      const kj::Path& targetPath,
+      kj::Maybe<const kj::Path&> referrer,
+      kj::Maybe<kj::StringPtr> rawSpecifier);
+
   virtual Promise<Value> resolveDynamicImport(jsg::Lock& js,
       const kj::Path& specifier,
       const kj::Path& referrer,

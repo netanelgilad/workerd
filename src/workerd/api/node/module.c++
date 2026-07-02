@@ -53,7 +53,7 @@ jsg::JsValue ModuleUtil::createRequire(jsg::Lock& js, kj::String path) {
   // The specifier must be a file: URL
   JSG_REQUIRE(parsed.getProtocol() == "file:"_kj, TypeError, "The specifier must be a file: URL.");
 
-  return jsg::JsValue(js.wrapReturningFunction(js.v8Context(),
+  auto requireFn = js.wrapReturningFunction(js.v8Context(),
       [referrer = kj::str(parsed.getPathname())](
           jsg::Lock& js, const v8::FunctionCallbackInfo<v8::Value>& args) -> v8::Local<v8::Value> {
     auto registry = jsg::ModuleRegistry::from(js);
@@ -110,7 +110,52 @@ jsg::JsValue ModuleUtil::createRequire(jsg::Lock& js, kj::String path) {
     }
 
     return jsg::ModuleRegistry::requireImpl(js, info, options);
-  }));
+  });
+
+  // FORK-ONLY (require-resolve): Node's createRequire() returns a require carrying `resolve`.
+  // Same resolution require performs (referrer-relative eval + registry resolution, including
+  // the VFS module fallback), returning the final registered absolute path WITHOUT evaluating
+  // the module. Builtin specifiers are returned untouched, matching Node.
+  auto resolveFn = js.wrapReturningFunction(js.v8Context(),
+      [referrer = kj::str(parsed.getPathname())](
+          jsg::Lock& js, const v8::FunctionCallbackInfo<v8::Value>& args) -> v8::Local<v8::Value> {
+    auto registry = jsg::ModuleRegistry::from(js);
+    JSG_REQUIRE(registry != nullptr, Error, "Module registry not available.");
+
+    auto spec = kj::str(args[0]);
+
+    if (spec.startsWith("node:") || spec.startsWith("cloudflare:") ||
+        spec.startsWith("workerd:") ||
+        (jsg::isNodeJsCompatEnabled(js) && jsg::checkNodeSpecifier(spec) != kj::none)) {
+      return js.str(spec);
+    }
+
+    auto ref = ([&] {
+      try {
+        return kj::Path::parse(referrer.slice(1));
+      } catch (kj::Exception& e) {
+        JSG_FAIL_REQUIRE(Error, kj::str("Invalid referrer path: ", referrer.slice(1)));
+      }
+    })();
+
+    static const kj::Path kRoot = kj::Path::parse("");
+
+    kj::Path targetPath = ([&] {
+      try {
+        return ref == kRoot ? kj::Path::parse(spec) : ref.parent().eval(spec);
+      } catch (kj::Exception&) {
+        JSG_FAIL_REQUIRE(Error, kj::str("Invalid specifier path: ", spec));
+      }
+    })();
+
+    return js.str(
+        JSG_REQUIRE_NONNULL(registry->resolveRequirePath(js, targetPath, ref, spec.asPtr()), Error,
+            "Cannot find module '", spec, "'"));
+  });
+
+  auto fnObj = jsg::JsObject(requireFn);
+  fnObj.set(js, "resolve", jsg::JsValue(resolveFn));
+  return jsg::JsValue(requireFn);
 }
 
 }  // namespace workerd::api::node

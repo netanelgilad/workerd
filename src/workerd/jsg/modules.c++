@@ -459,6 +459,25 @@ kj::Maybe<kj::OneOf<kj::String, ModuleRegistry::ModuleInfo>> tryResolveFromFallb
   return kj::none;
 }
 
+kj::Maybe<kj::String> ModuleRegistry::resolveRequirePath(jsg::Lock& js,
+    const kj::Path& targetPath,
+    kj::Maybe<const kj::Path&> referrer,
+    kj::Maybe<kj::StringPtr> rawSpecifier) {
+  // FORK-ONLY (require-resolve): see the declaration in modules.h. Resolution goes through the
+  // exact same virtual resolve() that require() uses (so the VFS fallback, redirects, and
+  // extension probing all apply), then the ModuleInfo is mapped back to its registry entry to
+  // recover the FINAL registered specifier -- which can differ from targetPath when the fallback
+  // redirected (e.g. bare specifier -> /tmp/node_modules/..., extensionless -> .js).
+  KJ_IF_SOME(info,
+      resolve(js, targetPath, referrer, ResolveOption::DEFAULT, ResolveMethod::REQUIRE,
+          rawSpecifier)) {
+    auto ref = KJ_ASSERT_NONNULL(
+        resolve(js, info.module.getHandle(js)), "resolved module not present in module registry");
+    return ref.specifier.toString(true);
+  }
+  return kj::none;
+}
+
 JsValue ModuleRegistry::requireImpl(Lock& js, ModuleInfo& info, RequireImplOptions options) {
   auto module = info.module.getHandle(js);
 

@@ -70,6 +70,57 @@ jsg::JsValue CommonJsModuleContext::require(jsg::Lock& js, kj::String specifier)
   return jsg::ModuleRegistry::requireImpl(js, info, options);
 }
 
+kj::String CommonJsModuleContext::requireResolve(jsg::Lock& js, kj::String specifier) {
+  // FORK-ONLY (require-resolve). Node returns builtin specifiers untouched from
+  // require.resolve() ('fs' -> 'fs', 'node:fs' -> 'node:fs'); match that before any resolution.
+  if (specifier.startsWith("node:") || specifier.startsWith("cloudflare:") ||
+      specifier.startsWith("workerd:")) {
+    return kj::mv(specifier);
+  }
+  if (isNodeJsCompatEnabled(js) && jsg::checkNodeSpecifier(specifier) != kj::none) {
+    return kj::mv(specifier);
+  }
+
+  if (FeatureFlags::get(js).getNewModuleRegistry()) {
+    // Not implemented for the new module registry; the fork's VFS-loaded Worker-Loader children
+    // (the consumers of require.resolve) run on the original registry.
+    JSG_FAIL_REQUIRE(Error, "require.resolve() is not implemented with the new module registry");
+  }
+
+  auto& path = KJ_ASSERT_NONNULL(pathOrSpecifier.tryGet<kj::Path>());
+
+  auto modulesForResolveCallback = jsg::getModulesForResolveCallback(js.v8Isolate);
+  KJ_REQUIRE(modulesForResolveCallback != nullptr, "didn't expect resolveCallback() now");
+
+  // Same referrer-relative evaluation require() performs (relative './x', '../x', absolute
+  // '/x', and bare specifiers -- the raw specifier travels along so the VFS fallback can do
+  // node_modules walking for bare names).
+  kj::Path targetPath = path.parent().eval(specifier);
+
+  return JSG_REQUIRE_NONNULL(
+      modulesForResolveCallback->resolveRequirePath(js, targetPath, path, specifier.asPtr()),
+      Error, "Cannot find module '", specifier, "'");
+}
+
+jsg::JsValue CommonJsModuleContext::getRequire(jsg::Lock& js) {
+  // FORK-ONLY (require-resolve): build the per-module `require` function object, carrying a
+  // `resolve` property like Node's. JSG caches the result on the instance (lazy property), so
+  // this runs at most once per module.
+  auto requireFn = js.wrapReturningFunction(js.v8Context(),
+      [self = JSG_THIS](jsg::Lock& js,
+          const v8::FunctionCallbackInfo<v8::Value>& args) mutable -> v8::Local<v8::Value> {
+    return self->require(js, js.toString(args[0]));
+  });
+  auto resolveFn = js.wrapReturningFunction(js.v8Context(),
+      [self = JSG_THIS](jsg::Lock& js,
+          const v8::FunctionCallbackInfo<v8::Value>& args) mutable -> v8::Local<v8::Value> {
+    return js.str(self->requireResolve(js, js.toString(args[0])));
+  });
+  auto obj = jsg::JsObject(requireFn);
+  obj.set(js, "resolve", jsg::JsValue(resolveFn));
+  return jsg::JsValue(requireFn);
+}
+
 void CommonJsModuleContext::visitForMemoryInfo(jsg::MemoryTracker& tracker) const {
   tracker.trackField("exports", exports);
   KJ_SWITCH_ONEOF(pathOrSpecifier) {

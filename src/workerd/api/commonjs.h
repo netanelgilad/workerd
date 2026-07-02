@@ -38,6 +38,19 @@ class CommonJsModuleContext final: public jsg::Object {
 
   jsg::JsValue require(jsg::Lock& js, kj::String specifier);
 
+  // FORK-ONLY (require-resolve): resolve `specifier` exactly as require() would (same
+  // referrer-relative eval + registry resolution, including the VFS module fallback for
+  // Worker-Loader children that opted in), returning the final registered module path as an
+  // absolute path string WITHOUT evaluating the module. Node builtin specifiers ("fs",
+  // "node:fs") are returned unchanged, matching Node.
+  kj::String requireResolve(jsg::Lock& js, kj::String specifier);
+
+  // FORK-ONLY (require-resolve): builds the per-module `require` function object exposed to CJS
+  // module bodies: calling it delegates to require() above, and it carries a `resolve` property
+  // delegating to requireResolve() -- Node's native require shape. Lazily created (and then
+  // cached by JSG) on first access.
+  jsg::JsValue getRequire(jsg::Lock& js);
+
   jsg::Ref<CommonJsModuleObject> getModule(jsg::Lock& js);
 
   jsg::JsValue getExports(jsg::Lock& js) const;
@@ -51,7 +64,10 @@ class CommonJsModuleContext final: public jsg::Object {
   }
 
   JSG_RESOURCE_TYPE(CommonJsModuleContext) {
-    JSG_METHOD(require);
+    // FORK-ONLY (require-resolve): `require` was previously JSG_METHOD(require) -- a shared
+    // prototype method with no properties, so `require.resolve` was undefined inside CJS modules.
+    // It is now a lazily-built per-module function object carrying `resolve` (see getRequire).
+    JSG_LAZY_READONLY_INSTANCE_PROPERTY(require, getRequire);
     JSG_READONLY_INSTANCE_PROPERTY(module, getModule);
     JSG_INSTANCE_PROPERTY(exports, getExports, setExports);
     JSG_LAZY_INSTANCE_PROPERTY(__filename, getFilename);
