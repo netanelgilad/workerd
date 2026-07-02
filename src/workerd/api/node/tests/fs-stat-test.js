@@ -46,7 +46,10 @@ function checkRootStat(stat, bigint = false) {
   strictEqual(stat.isSocket(), false);
   strictEqual(stat.dev, bigint ? 0n : 0);
   strictEqual(stat.ino, bigint ? 0n : 0);
-  strictEqual(stat.mode, bigint ? 16676n : 16676);
+  // FORK (vfs-root-mount): "/" is now a writable directory, so its mode is
+  // 0o40666 (S_IFDIR | 0o444 readable | 0o222 writable) instead of the old
+  // read-only 0o40444.
+  strictEqual(stat.mode, bigint ? 16822n : 16822);
   strictEqual(stat.nlink, bigint ? 1n : 1);
   strictEqual(stat.uid, bigint ? 0n : 0);
   strictEqual(stat.gid, bigint ? 0n : 0);

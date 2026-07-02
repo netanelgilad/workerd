@@ -42,7 +42,9 @@ strictEqual(W_OK, 2);
 strictEqual(R_OK, 4);
 
 const kKnownPaths = [
-  { path: '/', writable: false },
+  // FORK (vfs-root-mount): "/" is now writable (the writable store is
+  // re-rooted from /tmp to /), so W_OK on "/" succeeds.
+  { path: '/', writable: true },
   { path: '/bundle', writable: false },
   { path: '/bundle/worker', writable: false },
   { path: '/dev', writable: false },
