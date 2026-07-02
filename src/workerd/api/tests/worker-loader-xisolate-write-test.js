@@ -12,7 +12,13 @@
 // new content, and the file survives.
 
 import assert from 'node:assert';
-import { writeFileSync, readFileSync, appendFileSync, existsSync } from 'node:fs';
+import {
+  writeFileSync,
+  readFileSync,
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+} from 'node:fs';
 
 const CHILD_FLAGS = [
   'nodejs_compat',
@@ -45,6 +51,16 @@ function childCode() {
           }
           read(path) {
             if (!existsSync(path)) return null;
+            return readFileSync(path, "utf8");
+          }
+          // Mirrors npm's PackageJson.save over a pre-existing package.json: read the file the
+          // parent (warm dir) already wrote, parse it, add a dependency, then writeFileSync it
+          // back IN PLACE from this (child) isolate -- the exact real-world fork-gap-#5 flow.
+          npmSaveShape(path, dep, version) {
+            const pkg = JSON.parse(readFileSync(path, "utf8"));
+            pkg.dependencies = pkg.dependencies || {};
+            pkg.dependencies[dep] = version;
+            writeFileSync(path, JSON.stringify(pkg, null, 2) + "\\n");
             return readFileSync(path, "utf8");
           }
         }
@@ -133,5 +149,48 @@ export let crossIsolateBounce = {
       'v4-child'
     );
     assert.strictEqual(readFileSync(path, 'utf8'), 'v4-child');
+  },
+};
+
+// (d) real-world proof: npm's PackageJson.save over a PRE-EXISTING package.json (the "warm
+// dir" case). The parent/DO writes package.json (as `iso cp` would); a child isolate does
+// the read->parse->add-dep->writeFileSync-in-place that npm's PackageJson.save performs. Before
+// the fix this threw the internal error and npm's rollback DELETED package.json; after the fix
+// the file survives, carries the new dependency, and both isolates read it. This is the exact
+// scenario iso works around by pre-owning package.json in its npm launcher overlay.
+export let npmSaveOverExistingPackageJson = {
+  async test(ctrl, env, ctx) {
+    const path = '/tmp/proj/package.json';
+    const original = JSON.stringify(
+      { name: 'p', version: '1.0.0', scripts: { hello: 'echo hi' } },
+      null,
+      2
+    );
+
+    // Parent (warm dir) already has a package.json before any install runs.
+    mkdirSync('/tmp/proj', { recursive: true });
+    writeFileSync(path, original);
+    assert.ok(existsSync(path), 'parent package.json present before install');
+
+    const child = env.loader.get('xwrite-npm-child', childCode);
+    const childSaw = await child
+      .getEntrypoint()
+      .npmSaveShape(path, 'left-pad', '^1.3.0');
+
+    // File must SURVIVE the in-place save (npm's rollback used to delete it).
+    assert.ok(existsSync(path), 'package.json must survive the cross-isolate in-place save');
+
+    const parsedByChild = JSON.parse(childSaw);
+    assert.strictEqual(
+      parsedByChild.dependencies['left-pad'],
+      '^1.3.0',
+      'child must read back package.json carrying the new dependency'
+    );
+
+    // Parent reads the SAME updated file (shared store, isolate-agnostic bytes).
+    const parsedByParent = JSON.parse(readFileSync(path, 'utf8'));
+    assert.strictEqual(parsedByParent.name, 'p', 'original fields preserved');
+    assert.strictEqual(parsedByParent.dependencies['left-pad'], '^1.3.0');
+    assert.deepStrictEqual(parsedByParent.scripts, { hello: 'echo hi' });
   },
 };
