@@ -1010,6 +1010,12 @@ wd_test(
 )
 
 wd_test(
+    src = "worker-loader-nested-spawn-write-test.wd-test",
+    args = ["--experimental"],
+    data = ["worker-loader-nested-spawn-write-test.js"],
+)
+
+wd_test(
     src = "worker-loader-shared-tmp-test.wd-test",
     args = ["--experimental"],
     data = ["worker-loader-shared-tmp-test.js"],

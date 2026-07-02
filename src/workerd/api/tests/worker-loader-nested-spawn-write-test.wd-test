@@ -1,0 +1,25 @@
+using Workerd = import "/workerd/workerd.capnp";
+
+# FORK regression (gap #3): a nested native spawn from a NON-drainProcess child must be able to
+# write the shared VFS (cacache-shape mkdir + writeFileSync) without EPERM.
+const unitTests :Workerd.Config = (
+  services = [
+    ( name = "worker-loader-nested-spawn-write-test",
+      worker = (
+        modules = [
+          (name = "worker", esModule = embed "worker-loader-nested-spawn-write-test.js")
+        ],
+        compatibilityFlags = [
+          "nodejs_compat",
+          "nodejs_compat_v2",
+          "experimental",
+          "enable_nodejs_fs_module",
+          "enable_nodejs_child_process_module",
+        ],
+        bindings = [
+          (name = "loader", workerLoader = ()),
+        ],
+      )
+    ),
+  ],
+);
