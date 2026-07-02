@@ -2588,6 +2588,14 @@ class ExternalMemoryAdjustment final {
     return amount;
   }
 
+  // True if this adjustment is anchored to `js`'s isolate and that isolate is still alive.
+  // External allocations that are shared across isolates (e.g. the shared VFS file store) use
+  // this to decide whether an in-place mutation may adjust the existing accounting (same
+  // isolate) or must re-anchor to the current isolate (a different, or torn-down, isolate).
+  // Adjusting a foreign isolate's accounting would trip the isolate-affinity assert in
+  // ExternalMemoryTarget::adjustNow.
+  bool isForIsolate(Lock& js) const;
+
  private:
   kj::Arc<const ExternalMemoryTarget> externalMemory;
   size_t amount = 0;

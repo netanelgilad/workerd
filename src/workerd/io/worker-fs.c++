@@ -1114,8 +1114,7 @@ class FileImpl final: public File {
     } else {
       newData.asPtr().copyFrom(owned.data.first(size));
     }
-    owned.adjustment.setNow(js, newData.size());
-    owned.data = kj::mv(newData);
+    setOwnedData(js, kj::mv(newData));
     return kj::none;
   }
 
@@ -1180,9 +1179,7 @@ class FileImpl final: public File {
     auto stat = file->stat(js);
     auto buffer = kj::heapArray<kj::byte>(stat.size);
     file->read(js, 0, buffer.asPtr());
-    auto& owned = ownedOrView.get<Owned>();
-    owned.adjustment.setNow(js, buffer.size());
-    owned.data = kj::mv(buffer);
+    setOwnedData(js, kj::mv(buffer));
     lastModified = stat.lastModified;
     return kj::none;
   }
@@ -1224,6 +1221,29 @@ class FileImpl final: public File {
   bool isWritable() const {
     // Our file is only writable if it owns the actual data buffer.
     return ownedOrView.is<Owned>();
+  }
+
+  // Replace the owned byte buffer, keeping external-memory accounting correct across isolates.
+  //
+  // A FileImpl in the shared VFS store is handed to every isolate that shares the store (the DO
+  // and its sub-isolates). `Owned.adjustment` is anchored to whichever isolate first wrote the
+  // file. An in-place write from a *different* isolate (npm rewriting a pre-existing
+  // package.json is the canonical case) reaches here via resize()/replace(); calling
+  // adjustment.setNow() would then poke the creating isolate's external-memory target from the
+  // wrong isolate and trip the isolate-affinity assert in ExternalMemoryTarget::adjustNow
+  // ("internal error; reference = ..."), losing the write (and, under npm's rollback, deleting
+  // the file). Keep the file's bytes isolate-agnostic: adjust in place when the adjustment
+  // still belongs to the current isolate, otherwise re-anchor accounting to the current
+  // isolate. Re-anchoring releases the previous isolate's charge (deferred if that isolate is
+  // not the caller, and a no-op if it has already been torn down) and charges the current one.
+  void setOwnedData(jsg::Lock& js, kj::Array<kj::byte> newData) {
+    auto& owned = ownedOrView.get<Owned>();
+    if (owned.adjustment.isForIsolate(js)) {
+      owned.adjustment.setNow(js, newData.size());
+    } else {
+      owned.adjustment = js.getExternalMemoryAdjustment(newData.size());
+    }
+    owned.data = kj::mv(newData);
   }
 
   kj::ArrayPtr<kj::byte> writableView() {

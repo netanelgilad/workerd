@@ -516,6 +516,10 @@ void ExternalMemoryAdjustment::adjustNow(Lock& js, ssize_t amount) {
   externalMemory->adjustNow(js, amount);
 }
 
+bool ExternalMemoryAdjustment::isForIsolate(Lock& js) const {
+  return externalMemory->tryGetIsolate() == js.v8Isolate;
+}
+
 void ExternalMemoryAdjustment::set(size_t amount) {
   adjust(amount - this->amount);
 }
