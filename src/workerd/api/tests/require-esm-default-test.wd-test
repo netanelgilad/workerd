@@ -1,0 +1,28 @@
+using Workerd = import "/workerd/workerd.capnp";
+
+# FORK regression lock (gap #4): CJS require() of an ESM module with a default
+# export returns the default export itself, not the namespace. Config mirrors
+# iso's child runtime (nodejs_compat family + experimental). iso gets
+# require_returns_default_export on by its 2026-06-01 compat date (enable date
+# 2026-01-22); the wd_test harness injects its own --compat-date, so we enable
+# the flag explicitly here to pin the behavior independent of the harness date.
+const unitTests :Workerd.Config = (
+  services = [
+    ( name = "require-esm-default-test",
+      worker = (
+        modules = [
+          (name = "worker", esModule = embed "require-esm-default-test.js"),
+          (name = "esm-with-default", esModule = embed "require-esm-default-esm.js"),
+          (name = "cjs-requirer", commonJsModule = embed "require-esm-default-cjs.js"),
+        ],
+        compatibilityFlags = [
+          "nodejs_compat",
+          "nodejs_compat_v2",
+          "experimental",
+          "enable_nodejs_fs_module",
+          "require_returns_default_export",
+        ],
+      )
+    ),
+  ],
+);

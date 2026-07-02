@@ -407,6 +407,16 @@ wd_test(
 )
 
 wd_test(
+    src = "require-esm-default-test.wd-test",
+    args = ["--experimental"],
+    data = [
+        "require-esm-default-cjs.js",
+        "require-esm-default-esm.js",
+        "require-esm-default-test.js",
+    ],
+)
+
+wd_test(
     src = "crypto-extras-test.wd-test",
     args = ["--experimental"],
     data = ["crypto-extras-test.js"],
