@@ -21,11 +21,14 @@
 namespace workerd::server {
 namespace {
 
-// All VFS resolution is rooted at /tmp -- that is the directory shared with the parent DO.
-constexpr kj::StringPtr kVfsRoot = "/tmp"_kj;
+// FORK-ONLY (vfs-root-mount): all VFS resolution is rooted at "/" -- the shared writable store is
+// now mounted at the root, so the captured Directory IS "/" and npm-installed code lives at real
+// FHS paths like /usr/lib/node_modules/... (previously /tmp/usr/...). Any absolute path is "under
+// root". kVfsRoot is kept as a named constant for the ascend-termination checks below.
+constexpr kj::StringPtr kVfsRoot = "/"_kj;
 
 // ======================================================================================
-// Small path helpers operating on absolute VFS paths (always start with "/tmp").
+// Small path helpers operating on absolute VFS paths (always start with "/").
 
 bool isBareSpecifier(kj::StringPtr spec) {
   return !spec.startsWith("./") && !spec.startsWith("../") && !spec.startsWith("/") &&
@@ -86,23 +89,22 @@ kj::String extnameOf(kj::StringPtr path) {
 }
 
 // ======================================================================================
-// VFS access. We resolve directly against the captured /tmp Directory (NOT
-// VirtualFileSystem::current(js), which at module-resolution time sees a private empty /tmp).
+// VFS access. We resolve directly against the captured root Directory (NOT
+// VirtualFileSystem::current(js), which at module-resolution time sees a private empty store).
 //
-// All paths handled here are absolute like "/tmp/...". We convert to a path relative to the /tmp
-// directory before calling Directory::tryOpen/stat.
+// All paths handled here are absolute like "/usr/...". We convert to a path relative to the root
+// directory (drop the leading "/") before calling Directory::tryOpen/stat.
 
-// Convert an absolute "/tmp/..." path into a kj::Path relative to the /tmp directory. Returns
-// kj::none if the path is not under /tmp.
+// Convert an absolute "/..." path into a kj::Path relative to the root directory. Returns
+// kj::none if the path is not absolute.
 kj::Maybe<kj::Path> toTmpRelativePath(kj::StringPtr absPath) {
-  if (absPath == kVfsRoot) {
+  if (absPath == kVfsRoot || absPath.size() == 0) {
     return kj::Path(nullptr);
   }
-  auto prefix = kj::str(kVfsRoot, "/");
-  if (!absPath.startsWith(prefix)) {
+  if (!absPath.startsWith("/")) {
     return kj::none;
   }
-  auto rel = absPath.slice(prefix.size());
+  auto rel = absPath.slice(1);
   kj::Path root{};
   return root.eval(rel);
 }
@@ -786,10 +788,8 @@ kj::Maybe<kj::String> nodeResolve(jsg::Lock& js,
   }
 
   if (rawSpec.startsWith("/")) {
-    // Absolute path -- only honor it if it's under the VFS root.
-    if (!(rawSpec == kVfsRoot || rawSpec.startsWith(kj::str(kVfsRoot, "/")))) {
-      return kj::none;
-    }
+    // FORK-ONLY (vfs-root-mount): the store is rooted at "/", so ANY absolute path is under the
+    // VFS root -- resolve it directly.
     KJ_IF_SOME(file, resolveAsFile(js, tmpDir, rawSpec, method)) {
       return kj::mv(file);
     }
@@ -1045,10 +1045,9 @@ kj::Maybe<VfsResolveResult> resolveModuleFromVfs(jsg::Lock& js,
     if (!r.startsWith("/")) {
       r = kj::str("/", r);
     }
-    // Only treat as a VFS referrer if it is under the VFS root.
-    if (r == kVfsRoot || r.startsWith(kj::str(kVfsRoot, "/"))) {
-      referrerVfsPath = kj::mv(r);
-    }
+    // FORK-ONLY (vfs-root-mount): the store is rooted at "/", so any absolute referrer is a VFS
+    // referrer.
+    referrerVfsPath = kj::mv(r);
   }
 
   // For a bare specifier with no VFS referrer, root the node_modules walk at /tmp.

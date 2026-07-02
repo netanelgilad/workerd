@@ -67,6 +67,26 @@ static thread_local TmpDirStoreScope* tmpDirStorageScope = nullptr;
 // shadows it.
 static thread_local kj::Maybe<kj::Rc<Directory>> vfsModuleEvalFallbackDir = kj::none;
 
+// FORK-ONLY: resolve the shared in-memory writable store that backs the VFS. Prefers the active
+// IoContext's TmpDirStoreScope; falls back to the thread-local module-eval directory (installed
+// for VFS-module-loading children during global-scope evaluation, when no IoContext is on the
+// stack); finally a stack TmpDirStoreScope. Returns kj::none when none is available (e.g. isolate
+// setup for a worker that never touches the writable filesystem). This is the single chokepoint
+// through which both TmpDirectory (legacy /tmp mount) and RootDirectory (the re-rooted "/" mount)
+// reach the writable store, so they always see the SAME shared tree.
+kj::Maybe<kj::Rc<Directory>> tryGetSharedStore() {
+  KJ_IF_SOME(ioContext, IoContext::tryCurrent()) {
+    return ioContext.getTmpDirStoreScope().getDirectory();
+  }
+  KJ_IF_SOME(shared, vfsModuleEvalFallbackDir) {
+    return shared.addRef();
+  }
+  if (TmpDirStoreScope::hasCurrent()) {
+    return TmpDirStoreScope::current().getDirectory();
+  }
+  return kj::none;
+}
+
 // The TmpDirectory is a special directory implementation that uses the
 // current TmpDirStoreScope to actually store the directory contents. The
 // current TmpDirStoreScope can either be set on the stack or via the current
@@ -180,22 +200,150 @@ class TmpDirectory final: public Directory {
   mutable kj::Maybe<kj::String> maybeUniqueId;
 
   kj::Maybe<kj::Rc<Directory>> tryGetDirectory() const {
-    KJ_IF_SOME(ioContext, IoContext::tryCurrent()) {
-      return ioContext.getTmpDirStoreScope().getDirectory();
+    return tryGetSharedStore();
+  }
+};
+
+// FORK-ONLY (vfs-root-mount): the VFS root "/". Overlays the fixed read-only mounts (/bundle,
+// /dev) on top of the shared in-memory writable store (the very store that used to be mounted at
+// /tmp). Any path NOT under a mount is routed to that store, so the ENTIRE root is writable and
+// shared across the DO and every sub-isolate: a booted rootfs can live at real FHS paths (/usr,
+// /etc, /root, /work) and /tmp becomes just an ordinary writable subdir of the store. The store is
+// a pure in-memory tree (WritableDirectory == kj::HashMap) -- it is NEVER the host's real
+// filesystem -- so sandbox<->host isolation is preserved exactly as before; only the writable-root
+// mount point moved from /tmp to /. Sharing is unchanged: the store is captured/adopted via
+// TmpDirStoreScope (see shareParentTmp), so sibling "processes" see each other's writes anywhere
+// under /, exactly as they previously did under /tmp.
+class RootDirectory final: public Directory {
+ public:
+  explicit RootDirectory(kj::Rc<Directory> mounts): mounts(kj::mv(mounts)) {
+    for (auto& entry: *this->mounts) {
+      mountNames.insert(kj::str(entry.key));
     }
-    // FORK-ONLY (vfs-module-loading): when a VFS child has installed a module-eval fallback /tmp and
-    // there is NO active IoContext, prefer that shared directory over any stack TmpDirStoreScope.
-    // The stack scope reachable here during a dynamically-imported module's global-scope evaluation
-    // is the child's PRIVATE bootstrap scope (an empty /tmp), so honoring it would defeat the whole
-    // point -- npm packages read their data files from the shared /tmp at module-eval time. The
-    // parent DO is unaffected because it always runs its fs access with an IoContext (handled above).
-    KJ_IF_SOME(shared, vfsModuleEvalFallbackDir) {
-      return shared.addRef();
+  }
+
+  kj::Maybe<kj::OneOf<FsError, Stat>> stat(jsg::Lock& js, kj::PathPtr ptr) override {
+    if (ptr.size() == 0) {
+      // The root itself is a writable directory.
+      return kj::Maybe<kj::OneOf<FsError, Stat>>(Stat{
+        .type = FsType::DIRECTORY,
+        .size = 0,
+        .lastModified = kj::UNIX_EPOCH,
+        .writable = true,
+      });
     }
-    if (TmpDirStoreScope::hasCurrent()) {
-      return TmpDirStoreScope::current().getDirectory();
+    if (isMount(ptr)) {
+      return mounts->stat(js, ptr);
+    }
+    KJ_IF_SOME(store, tryGetSharedStore()) {
+      return store->stat(js, ptr);
     }
     return kj::none;
+  }
+
+  size_t count(jsg::Lock& js, kj::Maybe<FsType> typeFilter = kj::none) override {
+    size_t n = mounts->count(js, typeFilter);
+    KJ_IF_SOME(store, tryGetSharedStore()) {
+      n += store->count(js, typeFilter);
+    }
+    return n;
+  }
+
+  // NOTE (spike): iteration of the root lists the writable store's top-level entries only; the
+  // fixed /bundle and /dev mounts are reachable by path but are not enumerated here. No caller in
+  // the target scenario does readdir("/"), so this is an accepted spike simplification.
+  Entry* begin() override {
+    KJ_IF_SOME(store, tryGetSharedStore()) {
+      return store->begin();
+    }
+    return nullptr;
+  }
+  Entry* end() override {
+    KJ_IF_SOME(store, tryGetSharedStore()) {
+      return store->end();
+    }
+    return nullptr;
+  }
+  const Entry* begin() const override {
+    KJ_IF_SOME(store, tryGetSharedStore()) {
+      return store->begin();
+    }
+    return nullptr;
+  }
+  const Entry* end() const override {
+    KJ_IF_SOME(store, tryGetSharedStore()) {
+      return store->end();
+    }
+    return nullptr;
+  }
+
+  kj::Maybe<FsNodeWithError> tryOpen(
+      jsg::Lock& js, kj::PathPtr path, OpenOptions options = {}) override {
+    if (path.size() == 0) {
+      // Opening "/" returns this (writable) root directory.
+      return kj::Maybe<FsNodeWithError>(kj::Rc<Directory>(addRefToThis()));
+    }
+    if (isMount(path)) {
+      return mounts->tryOpen(js, path, kj::mv(options));
+    }
+    KJ_IF_SOME(store, tryGetSharedStore()) {
+      return store->tryOpen(js, path, kj::mv(options));
+    }
+    return kj::none;
+  }
+
+  kj::Maybe<FsError> add(jsg::Lock& js, kj::StringPtr name, Item entry) override {
+    if (mountNames.find(name) != kj::none) {
+      // Cannot shadow a fixed read-only mount at the root.
+      return FsError::ALREADY_EXISTS;
+    }
+    KJ_IF_SOME(store, tryGetSharedStore()) {
+      return store->add(js, name, kj::mv(entry));
+    }
+    return FsError::NOT_PERMITTED;
+  }
+
+  kj::OneOf<FsError, bool> remove(
+      jsg::Lock& js, kj::PathPtr path, RemoveOptions options = {}) override {
+    if (isMount(path)) {
+      // The /bundle and /dev mounts are read-only.
+      return FsError::NOT_PERMITTED;
+    }
+    KJ_IF_SOME(store, tryGetSharedStore()) {
+      return store->remove(js, path, kj::mv(options));
+    }
+    return false;
+  }
+
+  kj::StringPtr jsgGetMemoryName() const override {
+    return "RootDirectory"_kj;
+  }
+
+  size_t jsgGetMemorySelfSize() const override {
+    return sizeof(RootDirectory);
+  }
+
+  void jsgGetMemoryInfo(jsg::MemoryTracker& tracker) const override {
+    tracker.trackField("mounts", *mounts);
+  }
+
+  kj::StringPtr getUniqueId(jsg::Lock&) const override {
+    KJ_IF_SOME(id, maybeUniqueId) {
+      return id;
+    }
+    auto& ioContext = JSG_REQUIRE_NONNULL(
+        IoContext::tryCurrent(), Error, "Cannot generate a unique ID outside of a request");
+    maybeUniqueId = workerd::randomUUID(ioContext.getEntropySource());
+    return KJ_ASSERT_NONNULL(maybeUniqueId);
+  }
+
+ private:
+  kj::Rc<Directory> mounts;
+  kj::HashSet<kj::String> mountNames;
+  mutable kj::Maybe<kj::String> maybeUniqueId;
+
+  bool isMount(kj::PathPtr ptr) const {
+    return ptr.size() > 0 && mountNames.find(ptr[0]) != kj::none;
   }
 };
 
@@ -1306,12 +1454,15 @@ kj::Own<VirtualFileSystem> newVirtualFileSystem(
 kj::Own<VirtualFileSystem> newWorkerFileSystem(kj::Own<FsMap> fsMap,
     kj::Rc<Directory> bundleDirectory,
     kj::Own<VirtualFileSystem::Observer> observer) {
-  // Our root directory is a read-only directory
+  // FORK-ONLY (vfs-root-mount): the writable in-memory store is mounted at the ROOT "/" (via
+  // RootDirectory), NOT at /tmp. Only /bundle and /dev remain fixed read-only overlays; /tmp is now
+  // an ordinary writable subdir of the store. Everything under / (/usr, /etc, /root, /work, ...) is
+  // therefore writable and shared, so a booted rootfs can live at real FHS paths. See RootDirectory.
   Directory::Builder builder;
   builder.addPath(fsMap->getBundlePath(), kj::mv(bundleDirectory));
-  builder.addPath(fsMap->getTempPath(), getTmpDirectoryImpl());
   builder.addPath(fsMap->getDevPath(), getDevDirectory());
-  return newVirtualFileSystem(kj::mv(fsMap), builder.finish(), kj::mv(observer));
+  kj::Rc<Directory> root = kj::rc<RootDirectory>(builder.finish());
+  return newVirtualFileSystem(kj::mv(fsMap), kj::mv(root), kj::mv(observer));
 }
 
 kj::Rc<Directory> getTmpDirectoryImpl() {

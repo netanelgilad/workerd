@@ -44,9 +44,10 @@ struct VfsResolveResult {
   kj::Maybe<kj::Own<capnp::MallocMessageBuilder>> moduleMessage;
 };
 
-// Resolve a module specifier against the given /tmp directory (the shared directory captured at
-// load time -- typically the parent Durable Object's writable /tmp). Resolution is rooted at /tmp:
-// the resolved module specifiers and referrers are absolute paths like "/tmp/node_modules/x/...".
+// Resolve a module specifier against the given root directory (the shared writable store captured
+// at load time -- typically the parent Durable Object's writable "/"). FORK-ONLY (vfs-root-mount):
+// resolution is rooted at "/", so resolved module specifiers and referrers are absolute paths like
+// "/usr/lib/node_modules/x/..." (previously "/tmp/...").
 //
 // Returns kj::none when the specifier cannot be resolved (the registry then continues with its
 // normal "not found" handling). `method` selects import vs require resolution semantics (file
