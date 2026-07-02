@@ -41,6 +41,32 @@ jsg::JsValue CommonJsModuleContext::require(jsg::Lock& js, kj::String specifier)
   auto modulesForResolveCallback = jsg::getModulesForResolveCallback(js.v8Isolate);
   KJ_REQUIRE(modulesForResolveCallback != nullptr, "didn't expect resolveCallback() now");
 
+  auto requireOptions = jsg::ModuleRegistry::RequireImplOptions::DEFAULT;
+  if (FeatureFlags::get(js).getExportCommonJsDefaultNamespace()) {
+    requireOptions = jsg::ModuleRegistry::RequireImplOptions::EXPORT_DEFAULT;
+  }
+
+  // FORK-ONLY (vfs-module-loading): mirror the ESM resolveCallback's node:process redirect for
+  // CJS require(). `process` is the only node: builtin with no top-level `node:process` module --
+  // it lives as the internal module node-internal:{public,legacy}_process, and every other entry
+  // point (static import in modules.c++, dynamic import in modules.h) special-cases the redirect.
+  // The generic CJS resolve below never finds a `node:process` builtin, so without this it throws
+  // `No such module "node:process".`, which breaks real npm (npm-install-checks/lib/current-env.js
+  // does `require('process')`, normalized to `node:process` by checkNodeSpecifier above). All other
+  // node: builtins (fs, os, v8, ...) resolve identically for import and require via their real
+  // builtin modules; process is the sole gap.
+  if (specifier == "node:process") {
+    auto processSpec = kj::Path::parse(jsg::isNodeJsProcessV2Enabled(js)
+            ? "node-internal:public_process"_kj
+            : "node-internal:legacy_process"_kj);
+    auto& info = JSG_REQUIRE_NONNULL(
+        modulesForResolveCallback->resolve(js, processSpec, kj::none,
+            jsg::ModuleRegistry::ResolveOption::INTERNAL_ONLY,
+            jsg::ModuleRegistry::ResolveMethod::REQUIRE, specifier.asPtr()),
+        Error, "No such module \"", specifier, "\".");
+    return jsg::ModuleRegistry::requireImpl(js, info, requireOptions);
+  }
+
   kj::Path targetPath = ([&] {
     // If the specifier begins with one of our known prefixes, let's not resolve
     // it against the referrer.
