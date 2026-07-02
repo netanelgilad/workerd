@@ -20,8 +20,17 @@ import type { Duplex } from 'node:stream';
 // We don't intend to support the Agent API right now beyond providing a very limited stub API.
 //
 export class Agent extends EventEmitter implements _Agent {
-  defaultPort: number;
-  protocol: string;
+  // `declare` (type-only, no emitted class field) is load-bearing: a real class field would
+  // [[Define]] an OWN data property on every instance at construction, shadowing prototype
+  // accessors that subclasses install for these names. agent-base (used by npm's @npmcli/agent
+  // and the https-proxy-agent family) defines get/set protocol + defaultPort pairs on its
+  // prototype and relies on the base constructor's `this.protocol = ...` being a [[Set]] its
+  // setter can intercept (it deliberately swallows writes made during super(), keeping its
+  // getter live). Node's Agent assigns these only in the constructor, so subclass accessors
+  // work there; with a class field here, ClientRequest read the shadowing own 'http:' value
+  // and threw `Protocol "https:" not supported` on every agent-base HTTPS request.
+  declare defaultPort: number;
+  declare protocol: string;
 
   options: AgentOptions & { __proto__: null };
   agentKeepAliveTimeoutBuffer: number = 1000;
