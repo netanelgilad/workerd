@@ -39,16 +39,15 @@ export const testExports = {
   },
 };
 
+// FORK-ONLY (native-spawn): ChildProcess is now constructible (matching Node), since spawn()
+// builds real instances.
 export const testChildProcessConstructor = {
   async test() {
-    throws(
-      () => {
-        new ChildProcess();
-      },
-      {
-        code: 'ERR_METHOD_NOT_IMPLEMENTED',
-      }
-    );
+    const child = new ChildProcess();
+    ok(child instanceof ChildProcess);
+    strictEqual(child.exitCode, null);
+    strictEqual(child.killed, false);
+    strictEqual(typeof child.on, 'function');
   },
 };
 
@@ -301,6 +300,9 @@ export const testFork = {
   },
 };
 
+// FORK-ONLY (native-spawn): spawn() now returns a ChildProcess synchronously. In a worker
+// WITHOUT spawn capability (no workerLoader binding, not loaded with allowSpawn) it emits an
+// async 'error' with ERR_METHOD_NOT_IMPLEMENTED instead of throwing.
 export const testSpawn = {
   async test() {
     throws(
@@ -308,27 +310,29 @@ export const testSpawn = {
         spawn();
       },
       {
-        code: 'ERR_METHOD_NOT_IMPLEMENTED',
+        code: 'ERR_INVALID_ARG_TYPE',
       }
     );
 
-    throws(
-      () => {
-        spawn('ls');
-      },
-      {
-        code: 'ERR_METHOD_NOT_IMPLEMENTED',
-      }
-    );
+    const awaitSpawnError = (child) =>
+      new Promise((resolve) => child.on('error', resolve));
 
-    throws(
-      () => {
-        spawn('ls', ['-l']);
-      },
-      {
-        code: 'ERR_METHOD_NOT_IMPLEMENTED',
-      }
-    );
+    {
+      const child = spawn('ls');
+      ok(child instanceof ChildProcess);
+      ok(child.stdout);
+      ok(child.stderr);
+      const err = await awaitSpawnError(child);
+      strictEqual(err.code, 'ERR_METHOD_NOT_IMPLEMENTED');
+    }
+
+    {
+      const child = spawn('ls', ['-l']);
+      ok(child instanceof ChildProcess);
+      deepStrictEqual(child.spawnargs, ['ls', '-l']);
+      const err = await awaitSpawnError(child);
+      strictEqual(err.code, 'ERR_METHOD_NOT_IMPLEMENTED');
+    }
   },
 };
 
@@ -636,15 +640,6 @@ export const testErrorCodes = {
   async test() {
     throws(
       () => {
-        new ChildProcess();
-      },
-      {
-        code: 'ERR_METHOD_NOT_IMPLEMENTED',
-      }
-    );
-
-    throws(
-      () => {
         _forkChild(1, 2);
       },
       {
@@ -697,12 +692,13 @@ export const testErrorCodes = {
       }
     );
 
+    // FORK-ONLY (native-spawn): spawn() no longer throws synchronously; see testSpawn.
     throws(
       () => {
         spawn();
       },
       {
-        code: 'ERR_METHOD_NOT_IMPLEMENTED',
+        code: 'ERR_INVALID_ARG_TYPE',
       }
     );
 

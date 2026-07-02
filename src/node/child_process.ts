@@ -158,17 +158,17 @@ function tokenize(line: string): string[] {
   let q: string | null = null;
   let has = false;
   for (let i = 0; i < line.length; i++) {
-    const ch = line[i]!;
+    const ch = line.charAt(i);
     if (q) {
       if (ch === q) q = null;
       else if (q === '"' && ch === '\\' && i + 1 < line.length)
-        cur += line[++i];
+        cur += line.charAt(++i);
       else cur += ch;
     } else if (ch === "'" || ch === '"') {
       q = ch;
       has = true;
     } else if (ch === '\\' && i + 1 < line.length) {
-      cur += line[++i];
+      cur += line.charAt(++i);
       has = true;
     } else if (ch === ' ' || ch === '\t' || ch === '\n') {
       if (has || cur) {
@@ -237,14 +237,12 @@ function scanNmForBin(nm: string, cmd: string): string | null {
       continue;
     }
     const bin = pkg.bin;
-    const short = String(pkg.name ?? '')
-      .split('/')
-      .pop();
+    const short = (pkg.name ?? '').split('/').pop();
     if (typeof bin === 'string' && (pkg.name === cmd || short === cmd)) {
       return `${nm}/${d}/${bin.replace(/^\.\//, '')}`;
     }
     if (bin && typeof bin === 'object' && bin[cmd]) {
-      return `${nm}/${d}/${String(bin[cmd]).replace(/^\.\//, '')}`;
+      return `${nm}/${d}/${bin[cmd].replace(/^\.\//, '')}`;
     }
   }
   return null;
@@ -363,13 +361,18 @@ interface NormalizedSpawnOptions {
 function normalizeSpawnOptions(
   options: SpawnOptions | undefined | null
 ): NormalizedSpawnOptions {
+  const cwdOpt = options?.cwd;
   const cwd =
-    options?.cwd != null ? String(options.cwd as string | URL) : '/tmp';
+    cwdOpt == null
+      ? '/tmp'
+      : typeof cwdOpt === 'string'
+        ? cwdOpt
+        : cwdOpt.pathname;
   let env: Record<string, string>;
   if (options?.env != null) {
     env = {};
     for (const [k, v] of Object.entries(options.env)) {
-      if (v != null) env[k] = String(v);
+      if (v != null) env[k] = v;
     }
   } else {
     env = { ...(processEnv as Record<string, string>) };
@@ -506,7 +509,10 @@ async function runSpawn(
 
   if (rpcError != null && code === null) {
     // The child isolate failed outright without recording an exit; surface as 'error'.
-    throw rpcError;
+    if (rpcError instanceof Error) throw rpcError;
+    throw new Error(
+      typeof rpcError === 'string' ? rpcError : JSON.stringify(rpcError)
+    );
   }
 
   if (out) stdout.emit('data', Buffer.from(out));
