@@ -1012,6 +1012,12 @@ wd_test(
 )
 
 wd_test(
+    src = "worker-loader-xisolate-write-test.wd-test",
+    args = ["--experimental"],
+    data = ["worker-loader-xisolate-write-test.js"],
+)
+
+wd_test(
     src = "leak-fetch-test.wd-test",
     args = ["--experimental"],
     data = ["leak-fetch-test.js"],
