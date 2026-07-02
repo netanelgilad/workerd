@@ -299,7 +299,12 @@ export const otherExportsTest = {
 export const oobWriteTest = {
   test() {
     const v3 = Buffer.from('Test data for write operations');
-    const fd = openSync('/tmp/write-test.bin');
+    // Open for writing WITH create intent. Previously this opened with the
+    // default 'r' flag and relied on the non-POSIX auto-create-on-read (an
+    // 'r' open of a missing path silently created an empty file); under POSIX
+    // open() a read-only open of a missing file is ENOENT, so a write test must
+    // request a create flag.
+    const fd = openSync('/tmp/write-test.bin', 'w');
     throws(
       () => {
         strictEqual(writeSync(fd, v3, 10, 10, 4294967295), 0);

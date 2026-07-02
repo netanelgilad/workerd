@@ -5,6 +5,7 @@ import {
   ReadStream,
   createReadStream,
   statSync,
+  existsSync,
   writeFileSync,
   openSync,
   open as openAsync,
@@ -332,14 +333,22 @@ export const readStreamTest11 = {
 
 export const readStreamTest12 = {
   async test() {
-    // Make sure stream is destroyed when file does not exist.
-    const file = createReadStream('/path/to/file/that/does/not/exist');
+    // POSIX open() smoke: createReadStream() on a MISSING path must emit an
+    // 'error' with code 'ENOENT' (never fire 'data'), then close+destroy the
+    // stream -- and must NOT create the file. Before the open() fix, a bare
+    // read open auto-created an empty file, so neither 'data' nor 'error' fired
+    // and this hung.
+    const missing = '/path/to/file/that/does/not/exist';
+    const file = createReadStream(missing);
     const { promise, resolve, reject } = Promise.withResolvers();
     file.on('data', () => reject(new Error('should not be called')));
     file.on('error', resolve);
-    await promise;
+    const err = await promise;
+    strictEqual(err.code, 'ENOENT');
     ok(file.closed);
     ok(file.destroyed);
+    // The read open must not have materialized an empty file.
+    ok(!existsSync(missing));
   },
 };
 

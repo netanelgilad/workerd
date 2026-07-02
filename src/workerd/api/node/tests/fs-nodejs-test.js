@@ -68,6 +68,7 @@ const kErrInvalidArgType = { code: 'ERR_INVALID_ARG_TYPE' };
 const kErrInvalidArgValue = { code: 'ERR_INVALID_ARG_VALUE' };
 const kErrEBadf = { code: 'EBADF' };
 const kErrEExist = { code: 'EEXIST' };
+const kErrENoEnt = { code: 'ENOENT' };
 const kErrOutOfRange = { code: 'ERR_OUT_OF_RANGE' };
 
 export const openCloseTest = {
@@ -76,27 +77,42 @@ export const openCloseTest = {
     throws(() => fstatSync(123, { bigint: 'yes' }), kErrInvalidArgType);
     throws(() => fstatSync('abc'), kErrInvalidArgType);
 
-    // Test that all the mode combinations work
-    const modes = [
-      'r',
-      'r+',
-      'w',
-      'w+',
-      'a',
-      'a+',
-      'rs',
-      'rs+',
-      'wx',
-      'wx+',
-      'ax',
-      'ax+',
-    ];
-    for (const mode of modes) {
+    // Test that all the mode combinations work. POSIX open() only creates a
+    // missing file when the flag carries O_CREAT. The read flags ('r', 'rs',
+    // 'r+', 'rs+') do NOT create -- opening a missing path throws ENOENT (this
+    // was previously mis-encoded: the runtime auto-created the file even for a
+    // read-only open, so this test used to assert that 'r' created the file).
+    // The create flags ('w*', 'a*', and the exclusive 'wx*'/'ax*') create.
+    const createModes = ['w', 'w+', 'a', 'a+', 'wx', 'wx+', 'ax', 'ax+'];
+    const readModes = ['r', 'r+', 'rs', 'rs+'];
+
+    // Read flags on a missing file: ENOENT, and the file is NOT created.
+    for (const mode of readModes) {
+      ok(!existsSync('/tmp/test.txt'));
+      throws(() => openSync('/tmp/test.txt', mode), kErrENoEnt);
+      ok(!existsSync('/tmp/test.txt'));
+    }
+
+    // Read flags on an EXISTING file open successfully (create intent is not
+    // required because the file already exists).
+    for (const mode of readModes) {
+      writeFileSync('/tmp/test.txt', '');
+      const fd = openSync('/tmp/test.txt', mode);
+      ok(existsSync('/tmp/test.txt'));
+      const stat = fstatSync(fd, { bigint: true });
+      ok(stat);
+      closeSync(fd);
+      unlinkSync('/tmp/test.txt');
+    }
+
+    // Create flags create a missing file.
+    for (const mode of createModes) {
       // Open the file
       const fd = openSync('/tmp/test.txt', mode);
       ok(existsSync('/tmp/test.txt'));
       const stat = fstatSync(fd, { bigint: true });
       ok(stat);
+      closeSync(fd);
       unlinkSync('/tmp/test.txt');
     }
 

@@ -6,6 +6,7 @@ import {
   createWriteStream,
   createReadStream,
   readFileSync,
+  writeFileSync,
   closeSync,
   open as openAsync,
   close as closeAsync,
@@ -404,6 +405,14 @@ export const writeStreamTest18 = {
     const firstEncoding = 'base64';
     const secondEncoding = 'latin1';
 
+    // Seed the source file. Previously this test read /tmp/a WITHOUT creating
+    // it and relied on the non-POSIX auto-create-on-read: the missing source
+    // became an empty file, no data flowed, and the 'xyz\n' assertion below was
+    // never actually exercised. Under POSIX open(), reading a missing file is
+    // ENOENT, so the source must exist. Writing 'xyz\n' makes the base64->latin1
+    // pipe round-trip meaningful and the downstream assertion real.
+    writeFileSync(examplePath, 'xyz\n');
+
     const exampleReadStream = createReadStream(examplePath, {
       encoding: firstEncoding,
     });
@@ -418,6 +427,11 @@ export const writeStreamTest18 = {
         write: function (chunk, enc, next) {
           const expected = Buffer.from('xyz\n');
           deepStrictEqual(expected, chunk);
+          // Continue the stream. Previously /tmp/a was auto-created empty, so no
+          // data ever reached this callback and the missing next() went
+          // unnoticed; now that the source is seeded, the callback must signal
+          // completion or the pipe stalls and the test hangs.
+          next();
         },
       });
       assertWriteStream.setDefaultEncoding(secondEncoding);

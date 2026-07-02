@@ -93,6 +93,9 @@ struct NormalizedFilePath {
 [[noreturn]] void throwFsError(
     jsg::Lock& js, workerd::FsError error, kj::StringPtr syscall, kj::StringPtr path = nullptr) {
   switch (error) {
+    case workerd::FsError::NOT_FOUND: {
+      node::THROW_ERR_UV_ENOENT(js, syscall, nullptr, path);
+    }
     case workerd::FsError::NOT_DIRECTORY: {
       node::THROW_ERR_UV_ENOTDIR(js, syscall, nullptr, path);
     }
@@ -473,6 +476,7 @@ int FileSystemModule::open(jsg::Lock& js, FilePath path, OpenOptions options) {
                         .append = options.append,
                         .truncate = options.truncate,
                         .exclusive = options.exclusive,
+                        .create = options.create,
                         .followLinks = options.followSymlinks,
                       })) {
     KJ_CASE_ONEOF(opened, kj::Rc<workerd::VirtualFileSystem::OpenedFile>) {
@@ -2053,6 +2057,9 @@ constexpr bool isValidFileName(kj::StringPtr name) {
 
 jsg::Ref<jsg::DOMException> fsErrorToDomException(jsg::Lock& js, workerd::FsError error) {
   switch (error) {
+    case workerd::FsError::NOT_FOUND: {
+      return js.domException(kj::str("NotFoundError"), kj::str("File or directory not found"));
+    }
     case workerd::FsError::NOT_DIRECTORY: {
       return js.domException(kj::str("NotSupportedError"), kj::str("Not a directory"));
     }

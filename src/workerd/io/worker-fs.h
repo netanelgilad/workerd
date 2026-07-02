@@ -176,6 +176,9 @@ struct Stat final {
 class SymbolicLink;
 
 enum class FsError {
+  // Node does not exist (POSIX ENOENT). Surfaced when opening a missing path
+  // WITHOUT a create flag (O_CREAT), among other not-found conditions.
+  NOT_FOUND,
   // Path segment is not a directory
   NOT_DIRECTORY,
   // Directory is not empty
@@ -613,6 +616,13 @@ class VirtualFileSystem {
     // If true, opening the path will fail if it already exists.
     bool exclusive = false;
 
+    // If true, the file will be created if it does not already exist (POSIX
+    // O_CREAT). If false and the path does not exist, opening fails with
+    // NOT_FOUND (ENOENT). This is gated on the presence of O_CREAT in the
+    // open flags, NOT on write-vs-read: 'r+' is writable yet must not create,
+    // while 'w'/'a' carry O_CREAT and do.
+    bool create = false;
+
     // If true, and the destination is a symbolic link, the link will be
     // followed such that the file descriptor is opened on the target
     // of the symbolic link. If false, the file descriptor will be opened
@@ -672,6 +682,7 @@ class VirtualFileSystem {
         .append = false,
         .truncate = false,
         .exclusive = false,
+        .create = false,
         .followLinks = true}) const KJ_WARN_UNUSED_RESULT = 0;
 
   // Closes the given file descriptor. This is a no-op if the file descriptor is not open.

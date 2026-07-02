@@ -1,12 +1,21 @@
 // FORK-ONLY (vfs-module-loading): proves a Worker-Loader child can resolve and RUN JS modules
 // (ESM + CJS, relative + bare specifiers, node_modules + package.json) loaded entirely from the
-// in-isolate VFS /tmp it shares with the parent.
+// in-isolate VFS it shares with the parent.
 //
-// The parent (which has native node:fs to /tmp) writes module sources into /tmp, then loads a
-// child with `vfsModuleFallback: true` (+ `shareParentTmp: true` so the child's /tmp IS the
-// parent's). The child's main module imports/requires those VFS modules and returns a computed
-// result. This is the keystone: npm-installed code under /tmp/node_modules becomes import/require-
-// able inside a child via workerd's native module system, with no fallback service / RPC / thread.
+// The parent (which has native node:fs to the shared writable store) writes module sources into
+// the VFS, then loads a child with `vfsModuleFallback: true` (+ `shareParentTmp: true` so the
+// child's shared store IS the parent's). The child's main module imports/requires those VFS
+// modules and returns a computed result. This is the keystone: npm-installed code under
+// node_modules becomes import/require-able inside a child via workerd's native module system, with
+// no fallback service / RPC / thread.
+//
+// FORK-ONLY (vfs-root-mount + node-cwd-resolution): the shared writable store is now rooted at "/".
+// npm packages live at the FHS-style root `/node_modules/<pkg>` (previously under `/tmp`),
+// exactly as a real rootfs lays them out, so a bare specifier resolves by the standard Node
+// node_modules ASCEND to "/". The child's entry module ("main.js") anchors that walk at "/", and
+// createRequire("/tmp/main.js") anchors it at "/tmp" and ascends to "/" -- both reach
+// `/node_modules`. Relative + absolute imports under `/tmp/proj` (below) still exercise a writable
+// subdir of the shared store.
 
 import assert from 'node:assert';
 import { mkdirSync, writeFileSync } from 'node:fs';
@@ -36,15 +45,15 @@ function mkdirpAndWrite(path, contents) {
   writeFileSync(path, contents);
 }
 
-// 1) Bare ESM specifier resolved from /tmp/node_modules with package.json "main".
+// 1) Bare ESM specifier resolved from /node_modules with package.json "main".
 export let bareEsmFromNodeModules = {
   async test(ctrl, env, ctx) {
     mkdirpAndWrite(
-      '/tmp/node_modules/greet/package.json',
+      '/node_modules/greet/package.json',
       JSON.stringify({ name: 'greet', version: '1.0.0', main: 'lib/index.js' })
     );
     mkdirpAndWrite(
-      '/tmp/node_modules/greet/lib/index.js',
+      '/node_modules/greet/lib/index.js',
       `export default function greet(name) { return "hi " + name; }
        export const VERSION = "1.0.0";`
     );
@@ -63,15 +72,15 @@ export let bareEsmFromNodeModules = {
   },
 };
 
-// 2) CommonJS require() of a bare package (module.exports = fn) from /tmp/node_modules.
+// 2) CommonJS require() of a bare package (module.exports = fn) from /node_modules.
 export let bareCjsFromNodeModules = {
   async test(ctrl, env, ctx) {
     mkdirpAndWrite(
-      '/tmp/node_modules/adder/package.json',
+      '/node_modules/adder/package.json',
       JSON.stringify({ name: 'adder', version: '2.0.0', main: 'index.js' })
     );
     mkdirpAndWrite(
-      '/tmp/node_modules/adder/index.js',
+      '/node_modules/adder/index.js',
       `module.exports = function add(a, b) { return a + b; };
        module.exports.label = "adder";`
     );
@@ -125,16 +134,16 @@ export let relativeAndJson = {
 export let transitiveNodeModules = {
   async test(ctrl, env, ctx) {
     mkdirpAndWrite(
-      '/tmp/node_modules/dep/package.json',
+      '/node_modules/dep/package.json',
       JSON.stringify({ name: 'dep', main: 'index.js' })
     );
-    mkdirpAndWrite('/tmp/node_modules/dep/index.js', `module.exports = { value: 7 };`);
+    mkdirpAndWrite('/node_modules/dep/index.js', `module.exports = { value: 7 };`);
     mkdirpAndWrite(
-      '/tmp/node_modules/top/package.json',
+      '/node_modules/top/package.json',
       JSON.stringify({ name: 'top', main: 'index.js' })
     );
     mkdirpAndWrite(
-      '/tmp/node_modules/top/index.js',
+      '/node_modules/top/index.js',
       `const dep = require("dep"); module.exports = function () { return dep.value * 6; };`
     );
 
@@ -158,15 +167,15 @@ export let transitiveNodeModules = {
 export let exportsStringSugar = {
   async test(ctrl, env, ctx) {
     mkdirpAndWrite(
-      '/tmp/node_modules/expstr/package.json',
+      '/node_modules/expstr/package.json',
       JSON.stringify({ name: 'expstr', exports: './dist/main.js' })
     );
     mkdirpAndWrite(
-      '/tmp/node_modules/expstr/dist/main.js',
+      '/node_modules/expstr/dist/main.js',
       `export const tag = "expstr-string";`
     );
     // A file at the legacy main location that must NOT win (exports takes precedence).
-    mkdirpAndWrite('/tmp/node_modules/expstr/index.js', `export const tag = "WRONG";`);
+    mkdirpAndWrite('/node_modules/expstr/index.js', `export const tag = "WRONG";`);
 
     const c = env.loader.get('vfs-exports-string', () =>
       child(`
@@ -186,7 +195,7 @@ export let exportsStringSugar = {
 export let exportsConditions = {
   async test(ctrl, env, ctx) {
     mkdirpAndWrite(
-      '/tmp/node_modules/expcond/package.json',
+      '/node_modules/expcond/package.json',
       JSON.stringify({
         name: 'expcond',
         exports: {
@@ -199,12 +208,12 @@ export let exportsConditions = {
         },
       })
     );
-    mkdirpAndWrite('/tmp/node_modules/expcond/esm/index.js', `export const which = "esm";`);
+    mkdirpAndWrite('/node_modules/expcond/esm/index.js', `export const which = "esm";`);
     mkdirpAndWrite(
-      '/tmp/node_modules/expcond/cjs/index.js',
+      '/node_modules/expcond/cjs/index.js',
       `module.exports = { which: "cjs" };`
     );
-    mkdirpAndWrite('/tmp/node_modules/expcond/browser.js', `export const which = "browser";`);
+    mkdirpAndWrite('/node_modules/expcond/browser.js', `export const which = "browser";`);
 
     const c = env.loader.get('vfs-exports-cond', () =>
       child(`
@@ -228,7 +237,7 @@ export let exportsConditions = {
 export let exportsSubpath = {
   async test(ctrl, env, ctx) {
     mkdirpAndWrite(
-      '/tmp/node_modules/expsub/package.json',
+      '/node_modules/expsub/package.json',
       JSON.stringify({
         name: 'expsub',
         exports: {
@@ -237,13 +246,13 @@ export let exportsSubpath = {
         },
       })
     );
-    mkdirpAndWrite('/tmp/node_modules/expsub/index.js', `export const root = "root";`);
+    mkdirpAndWrite('/node_modules/expsub/index.js', `export const root = "root";`);
     mkdirpAndWrite(
-      '/tmp/node_modules/expsub/lib/feature.js',
+      '/node_modules/expsub/lib/feature.js',
       `export const feature = "feature-ok";`
     );
     // Present on disk but NOT in exports -> must be blocked.
-    mkdirpAndWrite('/tmp/node_modules/expsub/lib/secret.js', `export const secret = "leak";`);
+    mkdirpAndWrite('/node_modules/expsub/lib/secret.js', `export const secret = "leak";`);
 
     const c = env.loader.get('vfs-exports-subpath', () =>
       child(`
@@ -273,7 +282,7 @@ export let exportsSubpath = {
 export let exportsSubpathPattern = {
   async test(ctrl, env, ctx) {
     mkdirpAndWrite(
-      '/tmp/node_modules/exppat/package.json',
+      '/node_modules/exppat/package.json',
       JSON.stringify({
         name: 'exppat',
         exports: {
@@ -282,8 +291,8 @@ export let exportsSubpathPattern = {
         },
       })
     );
-    mkdirpAndWrite('/tmp/node_modules/exppat/dist/index.js', `export const k = "idx";`);
-    mkdirpAndWrite('/tmp/node_modules/exppat/dist/widget.js', `export const k = "widget";`);
+    mkdirpAndWrite('/node_modules/exppat/dist/index.js', `export const k = "idx";`);
+    mkdirpAndWrite('/node_modules/exppat/dist/widget.js', `export const k = "widget";`);
 
     const c = env.loader.get('vfs-exports-pattern', () =>
       child(`
@@ -302,7 +311,7 @@ export let exportsSubpathPattern = {
 export let importsHashMap = {
   async test(ctrl, env, ctx) {
     mkdirpAndWrite(
-      '/tmp/node_modules/imppkg/package.json',
+      '/node_modules/imppkg/package.json',
       JSON.stringify({
         name: 'imppkg',
         type: 'module',
@@ -314,17 +323,17 @@ export let importsHashMap = {
       })
     );
     mkdirpAndWrite(
-      '/tmp/node_modules/imppkg/index.js',
+      '/node_modules/imppkg/index.js',
       `import { secret } from "#internal";
        import { up } from "#util/strings";
        export const result = secret + ":" + up("x");`
     );
     mkdirpAndWrite(
-      '/tmp/node_modules/imppkg/internal/impl.js',
+      '/node_modules/imppkg/internal/impl.js',
       `export const secret = "from-internal";`
     );
     mkdirpAndWrite(
-      '/tmp/node_modules/imppkg/utils/strings.js',
+      '/node_modules/imppkg/utils/strings.js',
       `export function up(s) { return s.toUpperCase(); }`
     );
 
@@ -345,7 +354,7 @@ export let importsHashMap = {
 export let controlNoFallbackFails = {
   async test(ctrl, env, ctx) {
     mkdirpAndWrite(
-      '/tmp/node_modules/secret/index.js',
+      '/node_modules/secret/index.js',
       `export const value = "should-not-load";`
     );
 

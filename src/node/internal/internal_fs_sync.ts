@@ -80,6 +80,7 @@ import {
   O_APPEND,
   O_EXCL,
   O_TRUNC,
+  O_CREAT,
   COPYFILE_EXCL,
   COPYFILE_FICLONE,
   COPYFILE_FICLONE_FORCE,
@@ -514,6 +515,12 @@ export function openSync(
   const append = Boolean(newFlags & O_APPEND);
   const truncate = Boolean(newFlags & O_TRUNC);
   const exclusive = Boolean(newFlags & O_EXCL);
+  // POSIX create intent: only the flags that carry O_CREAT ('w*', 'a*', and the
+  // exclusive 'wx*'/'ax*' variants) create a missing file. Read flags ('r',
+  // 'rs', 'r+', 'rs+') do NOT carry O_CREAT and must fail with ENOENT on a
+  // missing path -- gated on O_CREAT, never on write-vs-read ('r+' is writable
+  // yet must not create).
+  const create = Boolean(newFlags & O_CREAT);
   const followSymlinks = true;
 
   return cffs.open(normalizePath(path), {
@@ -522,6 +529,7 @@ export function openSync(
     append,
     truncate,
     exclusive,
+    create,
     followSymlinks,
   });
 }

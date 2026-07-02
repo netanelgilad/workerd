@@ -93,9 +93,13 @@ class FileSystemModule final: public jsg::Object {
     bool truncate = false;
     // If the exclusive option is set, throw if the file already exists.
     bool exclusive;
+    // If the create option is set (O_CREAT), create the file when it does not
+    // exist. When false, opening a missing path fails with ENOENT rather than
+    // creating it. Derived from O_CREAT in the parsed open flags.
+    bool create = false;
     // If the followSymlinks option is set, follow symbolic links.
     bool followSymlinks = true;
-    JSG_STRUCT(read, write, append, truncate, exclusive, followSymlinks);
+    JSG_STRUCT(read, write, append, truncate, exclusive, create, followSymlinks);
   };
 
   int open(jsg::Lock& js, FilePath path, OpenOptions options);

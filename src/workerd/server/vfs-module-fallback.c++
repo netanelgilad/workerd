@@ -66,6 +66,21 @@ kj::String joinPath(kj::StringPtr base, kj::StringPtr rel) {
   return kj::str("/", joined);
 }
 
+// FORK-ONLY (node-cwd-resolution): the absolute VFS directory at which a NO-REFERRER bare
+// specifier begins its node_modules ascent. Real Node resolves an entry-point / no-referrer
+// `require('foo')` by walking up from the process cwd toward "/", checking `<dir>/node_modules/foo`
+// at each level. We read the cwd from the active TmpDirStoreScope (the same cwd chdir() mutates and
+// the IoContext exposes), and fall back to the VFS root when none is available (e.g. isolate setup
+// with no scope on the stack). Previously this rooted at kVfsRoot ("/") unconditionally, which only
+// found a top-level "/node_modules" and ignored the requester's working directory.
+kj::String cwdAbsolutePath() {
+  KJ_IF_SOME(cwd, getCurrentWorkingDirectory()) {
+    // kj::PathPtr::toString(true) prepends "/"; the empty (root) path yields "/".
+    return cwd.toString(true);
+  }
+  return kj::str(kVfsRoot);
+}
+
 kj::String dirnameOf(kj::StringPtr path) {
   KJ_IF_SOME(pos, path.findLast('/')) {
     if (pos == 0) return kj::str("/");
@@ -780,11 +795,15 @@ kj::Maybe<kj::String> nodeResolve(jsg::Lock& js,
   }
 
   // Base directory for relative resolution / node_modules walking.
+  //   - With a referrer: resolve relative to the referrer's directory (the normal case; transitive
+  //     imports between real VFS modules, and the /usr demo's npm-internal deps).
+  //   - Without a referrer: root at the process cwd and walk up to "/" (Node's entry-point / no-
+  //     referrer resolution), NOT at "/" unconditionally.
   kj::String baseDir;
   KJ_IF_SOME(ref, referrerPath) {
     baseDir = dirnameOf(ref);
   } else {
-    baseDir = kj::str(kVfsRoot);
+    baseDir = cwdAbsolutePath();
   }
 
   if (rawSpec.startsWith("/")) {
@@ -1046,12 +1065,15 @@ kj::Maybe<VfsResolveResult> resolveModuleFromVfs(jsg::Lock& js,
       r = kj::str("/", r);
     }
     // FORK-ONLY (vfs-root-mount): the store is rooted at "/", so any absolute referrer is a VFS
-    // referrer.
+    // referrer. A referrer that is an explicit resolution base (e.g. createRequire("/tmp/x.js"))
+    // is honored as-is even if the file itself does not exist -- Node roots resolution at its
+    // directory regardless.
     referrerVfsPath = kj::mv(r);
   }
 
-  // For a bare specifier with no VFS referrer, root the node_modules walk at /tmp.
-  // For relative specifiers with no VFS referrer, there's nothing to resolve against -> bail.
+  // For a bare specifier with no VFS referrer, root the node_modules walk at the process cwd (Node
+  // entry-point semantics; see nodeResolve). For relative specifiers with no VFS referrer, there's
+  // nothing to resolve against -> bail.
   if (referrerVfsPath == kj::none && !isBareSpecifier(rawSpec) && !rawSpec.startsWith("/")) {
     return kj::none;
   }

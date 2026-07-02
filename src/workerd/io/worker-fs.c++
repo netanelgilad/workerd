@@ -1331,10 +1331,16 @@ class VirtualFileSystemImpl final: public VirtualFileSystem {
       }
     }
 
+    // POSIX open(): only create the file when the open flags carry O_CREAT.
+    // For read-only / O_RDWR-without-create flags ('r', 'rs', 'r+', 'rs+') a
+    // missing path must NOT be auto-created -- it is ENOENT. Threading a real
+    // "create intent" (derived from O_CREAT) down to tryOpen is what makes the
+    // writable root faithful: `createReadStream('/missing')` now errors rather
+    // than silently materializing an empty file (and hanging the stream).
     KJ_IF_SOME(node,
         rootDir->tryOpen(js, path,
             Directory::OpenOptions{
-              .createAs = FsType::FILE,
+              .createAs = opts.create ? kj::Maybe<FsType>(FsType::FILE) : kj::none,
               .followLinks = opts.followLinks,
             })) {
       KJ_SWITCH_ONEOF(node) {
@@ -1395,8 +1401,14 @@ class VirtualFileSystemImpl final: public VirtualFileSystem {
       KJ_UNREACHABLE;
     }
 
-    // The file does not exist, and apparently was not created. Likely the
-    // directory is not writable or does not exist.
+    // tryOpen returned kj::none: the node does not exist and was not created.
+    // Without create intent (no O_CREAT) this is a plain not-found -> ENOENT.
+    // With create intent, reaching here means creation failed (e.g. a parent
+    // directory is missing or not writable), which we report as a generic
+    // failure.
+    if (!opts.create) {
+      return FsError::NOT_FOUND;
+    }
     return FsError::FAILED;
   }
 

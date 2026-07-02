@@ -41,6 +41,7 @@ export function open(
     append: boolean;
     truncate: boolean;
     exclusive: boolean;
+    create: boolean;
     followSymlinks: boolean;
   }
 ): number;

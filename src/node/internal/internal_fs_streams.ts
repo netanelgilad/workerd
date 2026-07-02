@@ -114,12 +114,24 @@ const kDefaultFsOperations: RealizedFsOperations = {
     cb?: SingleArgCallback<number>
   ): void {
     let callback: SingleArgCallback<number>;
+    // Resolve the polymorphic (flags, mode, cb) trailing-callback signature and
+    // capture the REAL flags/mode. These MUST be forwarded to the underlying
+    // open: the stream open flags ('r' for ReadStream, 'w' for WriteStream)
+    // decide read-vs-write and O_CREAT. Dropping them (opening every stream as
+    // 'r') only "worked" while open() auto-created missing files for reads;
+    // under POSIX open() a WriteStream must pass its create flag or the file is
+    // never created.
+    let realFlags: string | number = 'r';
+    let realMode: string | number = 0o666;
     if (typeof flags === 'function') {
       callback = flags;
     } else if (typeof mode === 'function') {
       callback = mode;
+      realFlags = flags;
     } else if (typeof cb === 'function') {
       callback = cb;
+      realFlags = flags;
+      realMode = mode;
     } else {
       throw new ERR_MISSING_ARGS('fs.open callback');
     }
@@ -127,7 +139,7 @@ const kDefaultFsOperations: RealizedFsOperations = {
 
     getLazyFs().then(
       (fs: RealizedFsOperations) => {
-        fs.open(path, (err: unknown, fd: number | undefined) => {
+        fs.open(path, realFlags, realMode, (err: unknown, fd: number | undefined) => {
           if (err) {
             try {
               callback(err);
@@ -410,7 +422,11 @@ function construct(
     (stream as any).open();
     return;
   }
-  stream[kFs].open(stream.path, (er: unknown, fd: number | undefined) => {
+  // Open with the stream's own flags/mode (ReadStream: 'r', WriteStream: 'w').
+  // These carry read-vs-write and O_CREAT; a WriteStream must open with its
+  // create flag so a missing target file is created (POSIX open() no longer
+  // auto-creates on a bare read open).
+  stream[kFs].open(stream.path, stream.flags, stream.mode, (er: unknown, fd: number | undefined) => {
     if (er) {
       callback(er);
       return;
@@ -1025,7 +1041,9 @@ export function WriteStream(
     start = 0,
     highWaterMark = 64 * 1024,
     signal = null,
-    flags = 'r',
+    // WriteStream opens for writing+create (Node's default is 'w'); a bare read
+    // open ('r') no longer auto-creates the target under POSIX open().
+    flags = 'w',
     fd = null,
     mode = 0o666,
     fs = kDefaultFsOperations,
@@ -1063,7 +1081,9 @@ export function WriteStream(
     this.fd = null;
     // Path will be ignored when fd is specified, so it can be falsy
     this.path = toPathIfFileURL(normalizePath(path));
-    this.flags = options.flags === undefined ? 'r' : options.flags;
+    // WriteStream default flag is 'w' (open for writing + O_CREAT), matching
+    // Node; the ReadStream default remains 'r'.
+    this.flags = options.flags === undefined ? 'w' : options.flags;
     this.mode = options.mode === undefined ? 0o666 : options.mode;
   } else {
     if (isFileHandle(fd)) {
