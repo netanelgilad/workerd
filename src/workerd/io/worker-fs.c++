@@ -204,6 +204,154 @@ class TmpDirectory final: public Directory {
   }
 };
 
+// FORK-ONLY (vfs-root-mount): the "/tmp" mount. In the re-rooted world /tmp is an ordinary writable
+// subdirectory of the shared store (store/"tmp"/...), but it is still surfaced as a FIRST-CLASS root
+// entry so that (a) readdir("/") lists it in its historical slot (bundle, tmp, dev -- the
+// KNOWN_VFS_ROOTS order) and (b) it always "exists" (stat/chdir/os.tmpdir succeed) even before the
+// first write. This directory delegates every operation to the store's "tmp" child, creating
+// (seeding) that child on first locked access. Because the child lives in the SAME shared store that
+// RootDirectory routes every other path to, sibling isolates that share the store (shareParentTmp)
+// see each other's /tmp writes, exactly as they see writes anywhere else under "/".
+class TmpMountDirectory final: public Directory {
+ public:
+  kj::Maybe<kj::OneOf<FsError, Stat>> stat(jsg::Lock& js, kj::PathPtr ptr) override {
+    KJ_IF_SOME(dir, resolveTmpDir(js)) {
+      return kj::Maybe<kj::OneOf<FsError, Stat>>(dir->stat(js, ptr));
+    }
+    if (ptr.size() == 0) {
+      return kj::Maybe<kj::OneOf<FsError, Stat>>(Stat{
+        .type = FsType::DIRECTORY,
+        .size = 0,
+        .lastModified = kj::UNIX_EPOCH,
+        .writable = true,
+      });
+    }
+    return kj::none;
+  }
+
+  size_t count(jsg::Lock& js, kj::Maybe<FsType> typeFilter = kj::none) override {
+    KJ_IF_SOME(dir, resolveTmpDir(js)) {
+      return dir->count(js, typeFilter);
+    }
+    return 0;
+  }
+
+  // begin()/end() have no jsg::Lock, so they cannot seed store/tmp; they only PEEK (lock-free
+  // iteration is permitted while the isolate lock is held by the caller). If store/tmp has not been
+  // materialized yet, iteration is empty -- which is correct: an unseeded /tmp has no entries.
+  Entry* begin() override {
+    KJ_IF_SOME(dir, peekTmpDir()) {
+      return dir->begin();
+    }
+    return nullptr;
+  }
+  Entry* end() override {
+    KJ_IF_SOME(dir, peekTmpDir()) {
+      return dir->end();
+    }
+    return nullptr;
+  }
+  const Entry* begin() const override {
+    KJ_IF_SOME(dir, peekTmpDir()) {
+      return dir->begin();
+    }
+    return nullptr;
+  }
+  const Entry* end() const override {
+    KJ_IF_SOME(dir, peekTmpDir()) {
+      return dir->end();
+    }
+    return nullptr;
+  }
+
+  kj::Maybe<FsNodeWithError> tryOpen(
+      jsg::Lock& js, kj::PathPtr path, OpenOptions options = {}) override {
+    KJ_IF_SOME(dir, resolveTmpDir(js)) {
+      return dir->tryOpen(js, path, kj::mv(options));
+    }
+    return kj::none;
+  }
+
+  kj::Maybe<FsError> add(jsg::Lock& js, kj::StringPtr name, Item entry) override {
+    KJ_IF_SOME(dir, resolveTmpDir(js)) {
+      return dir->add(js, name, kj::mv(entry));
+    }
+    return FsError::NOT_PERMITTED;
+  }
+
+  kj::OneOf<FsError, bool> remove(
+      jsg::Lock& js, kj::PathPtr path, RemoveOptions options = {}) override {
+    KJ_IF_SOME(dir, resolveTmpDir(js)) {
+      return dir->remove(js, path, kj::mv(options));
+    }
+    return false;
+  }
+
+  kj::StringPtr jsgGetMemoryName() const override {
+    return "TmpMountDirectory"_kj;
+  }
+  size_t jsgGetMemorySelfSize() const override {
+    return sizeof(TmpMountDirectory);
+  }
+  void jsgGetMemoryInfo(jsg::MemoryTracker& tracker) const override {
+    // Contents live in the shared store; tracked there, not here.
+  }
+
+  kj::StringPtr getUniqueId(jsg::Lock&) const override {
+    KJ_IF_SOME(id, maybeUniqueId) {
+      return id;
+    }
+    auto& ioContext = JSG_REQUIRE_NONNULL(
+        IoContext::tryCurrent(), Error, "Cannot generate a unique ID outside of a request");
+    maybeUniqueId = workerd::randomUUID(ioContext.getEntropySource());
+    return KJ_ASSERT_NONNULL(maybeUniqueId);
+  }
+
+ private:
+  mutable kj::Maybe<kj::String> maybeUniqueId;
+
+  // Resolve the store's "tmp" child, CREATING it if absent (Gap 1 seed). Requires a lock. This is
+  // the single seam through which /tmp is materialized in the shared store, so every isolate that
+  // shares the store converges on the same /tmp directory.
+  kj::Maybe<kj::Rc<Directory>> resolveTmpDir(jsg::Lock& js) const {
+    KJ_IF_SOME(store, tryGetSharedStore()) {
+      KJ_IF_SOME(opened,
+          store->tryOpen(js, kj::Path({"tmp"}),
+              OpenOptions{
+                .createAs = FsType::DIRECTORY,
+              })) {
+        KJ_SWITCH_ONEOF(opened) {
+          KJ_CASE_ONEOF(dir, kj::Rc<Directory>) {
+            return kj::mv(dir);
+          }
+          KJ_CASE_ONEOF(file, kj::Rc<File>) {}
+          KJ_CASE_ONEOF(link, kj::Rc<SymbolicLink>) {}
+          KJ_CASE_ONEOF(err, FsError) {}
+        }
+      }
+    }
+    return kj::none;
+  }
+
+  // Lock-free lookup of the store's "tmp" child WITHOUT creating it (for begin()/end()).
+  kj::Maybe<kj::Rc<Directory>> peekTmpDir() const {
+    KJ_IF_SOME(store, tryGetSharedStore()) {
+      for (auto& entry: *store) {
+        if (entry.key == "tmp"_kj) {
+          KJ_SWITCH_ONEOF(entry.value) {
+            KJ_CASE_ONEOF(dir, kj::Rc<Directory>) {
+              return dir.addRef();
+            }
+            KJ_CASE_ONEOF(file, kj::Rc<File>) {}
+            KJ_CASE_ONEOF(link, kj::Rc<SymbolicLink>) {}
+          }
+        }
+      }
+    }
+    return kj::none;
+  }
+};
+
 // FORK-ONLY (vfs-root-mount): the VFS root "/". Overlays the fixed read-only mounts (/bundle,
 // /dev) on top of the shared in-memory writable store (the very store that used to be mounted at
 // /tmp). Any path NOT under a mount is routed to that store, so the ENTIRE root is writable and
@@ -242,39 +390,50 @@ class RootDirectory final: public Directory {
   }
 
   size_t count(jsg::Lock& js, kj::Maybe<FsType> typeFilter = kj::none) override {
-    size_t n = mounts->count(js, typeFilter);
-    KJ_IF_SOME(store, tryGetSharedStore()) {
-      n += store->count(js, typeFilter);
+    rebuildMergedView();
+    KJ_IF_SOME(type, typeFilter) {
+      return std::count_if(mergedView.begin(), mergedView.end(), [type](const auto& entry) {
+        KJ_SWITCH_ONEOF(entry.value) {
+          KJ_CASE_ONEOF(file, kj::Rc<File>) {
+            return type == FsType::FILE;
+          }
+          KJ_CASE_ONEOF(dir, kj::Rc<Directory>) {
+            return type == FsType::DIRECTORY;
+          }
+          KJ_CASE_ONEOF(link, kj::Rc<SymbolicLink>) {
+            return type == FsType::SYMLINK;
+          }
+        }
+        KJ_UNREACHABLE;
+      });
     }
-    return n;
+    return mergedView.size();
   }
 
-  // NOTE (spike): iteration of the root lists the writable store's top-level entries only; the
-  // fixed /bundle and /dev mounts are reachable by path but are not enumerated here. No caller in
-  // the target scenario does readdir("/"), so this is an accepted spike simplification.
+  // Enumerating "/" yields the UNION of the fixed mounts (/bundle, /tmp, /dev -- in KNOWN_VFS_ROOTS
+  // order) and the writable store's top-level entries (/usr, /work, ... for a booted rootfs), deduped
+  // by name so a store entry never double-lists a mount (notably the seeded store/"tmp", which is
+  // surfaced via the /tmp mount instead). Because the Directory iterator is a raw Entry* range over a
+  // single contiguous container, we cannot stitch two ranges together; instead we materialize the
+  // merged, ordered, deduped entries into `mergedView` and iterate that. begin() rebuilds; end()
+  // returns the end of the view begin() just built (range-for calls begin() then end()). Lock-free:
+  // iterating mounts/store and addRef'ing entries does not require a jsg::Lock (the caller holds the
+  // isolate lock while iterating, per the Directory iterator contract).
   Entry* begin() override {
-    KJ_IF_SOME(store, tryGetSharedStore()) {
-      return store->begin();
-    }
-    return nullptr;
+    rebuildMergedView();
+    return mergedView.begin();
   }
   Entry* end() override {
-    KJ_IF_SOME(store, tryGetSharedStore()) {
-      return store->end();
-    }
-    return nullptr;
+    return mergedView.end();
   }
   const Entry* begin() const override {
-    KJ_IF_SOME(store, tryGetSharedStore()) {
-      return store->begin();
-    }
-    return nullptr;
+    // Rebuilding the cache mutates refcounts (addRef), so it lives in a non-const helper; the
+    // operation is logically const (it just refreshes a view of current state).
+    const_cast<RootDirectory*>(this)->rebuildMergedView();
+    return mergedView.begin();
   }
   const Entry* end() const override {
-    KJ_IF_SOME(store, tryGetSharedStore()) {
-      return store->end();
-    }
-    return nullptr;
+    return mergedView.end();
   }
 
   kj::Maybe<FsNodeWithError> tryOpen(
@@ -306,8 +465,11 @@ class RootDirectory final: public Directory {
   kj::OneOf<FsError, bool> remove(
       jsg::Lock& js, kj::PathPtr path, RemoveOptions options = {}) override {
     if (isMount(path)) {
-      // The /bundle and /dev mounts are read-only.
-      return FsError::NOT_PERMITTED;
+      // Route into the mount so the target decides writability: /tmp is a writable mount (delegates
+      // removal into the shared store), while /bundle and /dev are read-only DirectoryBases that
+      // reject the write. Removing a mount point itself (path.size() == 1) is likewise rejected by
+      // the read-only mounts container.
+      return mounts->remove(js, path, kj::mv(options));
     }
     KJ_IF_SOME(store, tryGetSharedStore()) {
       return store->remove(js, path, kj::mv(options));
@@ -341,9 +503,44 @@ class RootDirectory final: public Directory {
   kj::Rc<Directory> mounts;
   kj::HashSet<kj::String> mountNames;
   mutable kj::Maybe<kj::String> maybeUniqueId;
+  // Backing store for begin()/end(): the ordered, deduped union of the mounts and the writable
+  // store's top-level entries. Rebuilt on each begin()/count() call so it reflects the current
+  // store (which varies per IoContext). See the comment on begin().
+  mutable kj::HashMap<kj::String, Item> mergedView;
 
   bool isMount(kj::PathPtr ptr) const {
     return ptr.size() > 0 && mountNames.find(ptr[0]) != kj::none;
+  }
+
+  static Item cloneItem(Item& item) {
+    KJ_SWITCH_ONEOF(item) {
+      KJ_CASE_ONEOF(file, kj::Rc<File>) {
+        return Item(file.addRef());
+      }
+      KJ_CASE_ONEOF(dir, kj::Rc<Directory>) {
+        return Item(dir.addRef());
+      }
+      KJ_CASE_ONEOF(link, kj::Rc<SymbolicLink>) {
+        return Item(link.addRef());
+      }
+    }
+    KJ_UNREACHABLE;
+  }
+
+  void rebuildMergedView() {
+    mergedView.clear();
+    // Fixed mounts first, in their builder order (bundle, tmp, dev == KNOWN_VFS_ROOTS order).
+    for (auto& entry: *mounts) {
+      mergedView.upsert(kj::str(entry.key), cloneItem(entry.value), [](Item&, Item&&) {});
+    }
+    // Then the writable store's top-level entries, skipping any that shadow a mount name (e.g. the
+    // seeded store/"tmp", which is surfaced through the /tmp mount above).
+    KJ_IF_SOME(store, tryGetSharedStore()) {
+      for (auto& entry: *store) {
+        if (mountNames.find(entry.key) != kj::none) continue;
+        mergedView.upsert(kj::str(entry.key), cloneItem(entry.value), [](Item&, Item&&) {});
+      }
+    }
   }
 };
 
@@ -1455,11 +1652,17 @@ kj::Own<VirtualFileSystem> newWorkerFileSystem(kj::Own<FsMap> fsMap,
     kj::Rc<Directory> bundleDirectory,
     kj::Own<VirtualFileSystem::Observer> observer) {
   // FORK-ONLY (vfs-root-mount): the writable in-memory store is mounted at the ROOT "/" (via
-  // RootDirectory), NOT at /tmp. Only /bundle and /dev remain fixed read-only overlays; /tmp is now
-  // an ordinary writable subdir of the store. Everything under / (/usr, /etc, /root, /work, ...) is
-  // therefore writable and shared, so a booted rootfs can live at real FHS paths. See RootDirectory.
+  // RootDirectory). Everything under / (/usr, /etc, /root, /work, ...) is writable and shared, so a
+  // booted rootfs can live at real FHS paths. Three roots are surfaced as fixed overlay mounts in
+  // KNOWN_VFS_ROOTS order (bundle, tmp, dev) so readdir("/") lists them in that order: /bundle is a
+  // read-only bundle overlay, /dev a read-only device overlay, and /tmp a WRITABLE mount whose
+  // contents live in the shared store under "tmp/..." (see TmpMountDirectory). Keeping /tmp as a
+  // first-class root entry preserves the historical readdir("/") == [bundle, tmp, dev] contract and
+  // ensures /tmp always exists (stat/chdir/os.tmpdir) even before the first write.
+  kj::Rc<Directory> tmpMount = kj::rc<TmpMountDirectory>();
   Directory::Builder builder;
   builder.addPath(fsMap->getBundlePath(), kj::mv(bundleDirectory));
+  builder.addPath(fsMap->getTempPath(), kj::mv(tmpMount));
   builder.addPath(fsMap->getDevPath(), getDevDirectory());
   kj::Rc<Directory> root = kj::rc<RootDirectory>(builder.finish());
   return newVirtualFileSystem(kj::mv(fsMap), kj::mv(root), kj::mv(observer));
