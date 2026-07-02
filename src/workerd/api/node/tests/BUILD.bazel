@@ -47,6 +47,12 @@ wd_test(
 )
 
 wd_test(
+    src = "child_process-spawn-observability-test.wd-test",
+    args = ["--experimental"],
+    data = ["child_process-spawn-observability-test.js"],
+)
+
+wd_test(
     src = "console-nodejs-test.wd-test",
     args = ["--experimental"],
     data = ["console-nodejs-test.js"],

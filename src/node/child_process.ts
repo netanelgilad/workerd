@@ -68,12 +68,47 @@ const CHILD_COMPAT_FLAGS = [
   'enable_nodejs_fs_module',
 ];
 
+// ---------------------------------------------------------------------------
+// FORK-ONLY (native-spawn observability, gap #2): pid/ppid + lifecycle events.
+//
+// Native spawn has no OS process model, so the runtime assigns its own pids (a process-global
+// monotonic counter in C++; pid 1 is the root DO). A spawned child learns its own pid from
+// process.pid (the probe injects it) and stamps it as its children's ppid, so ppid chains
+// reconstruct the full pstree. spawn/exit events are appended to a process-global, append-only log
+// (childProcessUtil.emitLifecycleEvent) that a consumer reads incrementally by cursor
+// (readLifecycleEvents) -- exited processes stay observable.
+
+// The current isolate's own pid: a spawned child's is injected onto process.pid by its parent's
+// probe; the root DO keeps workerd's default process.pid (1), a stable root pid (Node's
+// init-process convention). Cached: an isolate's pid is fixed for its lifetime.
+let cachedMyPid: number | null = null;
+function myPid(): number {
+  if (cachedMyPid != null) return cachedMyPid;
+  const injected = (globalThis as { process?: { pid?: number } }).process?.pid;
+  cachedMyPid = typeof injected === 'number' && injected > 0 ? injected : 1;
+  return cachedMyPid;
+}
+
+// Append a lifecycle event to the process-global bus. Best-effort: observability must never affect
+// the spawn itself, and the append is synchronous (no pending I/O -> does not block quiescence).
+function emitLifecycle(ev: Record<string, unknown>): void {
+  try {
+    childProcessUtil.emitLifecycleEvent(JSON.stringify(ev));
+  } catch {
+    // ignore -- observability is best-effort
+  }
+}
+
 export class ChildProcess extends EventEmitter implements _ChildProcess {
   stdin: Writable | null = null;
   stdout: Readable | null = null;
   stderr: Readable | null = null;
   killed: boolean = false;
   pid: number | undefined = undefined;
+  // FORK-ONLY (native-spawn observability, gap #2): the parent's pid. Node's ChildProcess has no
+  // `ppid`, but native spawn has no OS process table, so we surface it here for observability
+  // (the same value rides the emitted `spawn` lifecycle event).
+  ppid: number | undefined = undefined;
   stdio: [
     Writable | null,
     Readable | null,
@@ -377,7 +412,9 @@ function probeSource(
   argv: string[],
   cwd: string,
   envObj: Record<string, string>,
-  dir: string
+  dir: string,
+  pid: number,
+  ppid: number
 ): string {
   const STATUS = JSON.stringify(`${dir}/status.json`);
   // run(stdinReadable, stdoutWritable, stderrWritable): the three stdio halves are handed in over
@@ -432,6 +469,10 @@ function probeSource(
       let exitCodeShadow = null; // mirrors process.exitCode (node's implicit exit code)
       for (const p of new Set([np.default, np, globalThis.process].filter(Boolean))) {
         try { p.argv = ${JSON.stringify(argv)}.slice(); } catch {}
+        // pid/ppid: this child's OWN pid (so its own child_process reads it as ppid for grandchildren)
+        // and its parent's pid. Node-faithful (process.pid/process.ppid) and drives the pstree.
+        try { Object.defineProperty(p, "pid", { configurable: true, value: ${pid} }); } catch { try { p.pid = ${pid}; } catch {} }
+        try { Object.defineProperty(p, "ppid", { configurable: true, value: ${ppid} }); } catch { try { p.ppid = ${ppid}; } catch {} }
         try { p.cwd = () => ${JSON.stringify(cwd)}; } catch { try { Object.defineProperty(p, "cwd", { configurable: true, value: () => ${JSON.stringify(cwd)} }); } catch {} }
         try { p.env = Object.assign(p.env || {}, ${JSON.stringify(envObj)}); } catch {}
         try { Object.defineProperty(p, "stdin", { configurable: true, get: () => nodeStdin }); } catch {}
@@ -462,8 +503,6 @@ function probeSource(
     }
   }`;
 }
-
-let spawnCounter = 0;
 
 interface NormalizedSpawnOptions {
   cwd: string;
@@ -594,6 +633,9 @@ async function runSpawn(
     if (stdoutTarget) stdoutTarget.push(null);
     if (stderrTarget) stderrTarget.push(null);
     io.stdinWriter?.close().catch(() => {});
+    // Lifecycle: the child (pid) has exited. Emitted before 'exit'/'close' so the event stream
+    // records the exit even if a listener throws. Exited processes stay observable in the log.
+    emitLifecycle({ type: 'exit', pid: child.pid, code });
     child.emit('exit', code, null);
     child.emit('close', code, null);
   };
@@ -660,13 +702,21 @@ async function runSpawn(
   entry = stripShebang(entry);
   const childArgv = ['node', entry, ...childArgs];
 
-  // Materialize the probe under the shared /tmp and load the sub-isolate over it.
-  const dir = `/tmp/.spawn-${++spawnCounter}-${Date.now().toString(36)}`;
+  // pid (globally-unique, already assigned on the handle) + ppid (this spawner's own pid). The
+  // child's probe injects pid onto its process.pid, so when the child spawns a grandchild it stamps
+  // this pid as the grandchild's ppid -- the ppid chain that reconstructs the pstree.
+  const pid = child.pid ?? 0;
+  const ppid = myPid();
+
+  // Materialize the probe under the shared /tmp and load the sub-isolate over it. The dir is keyed
+  // by the globally-unique pid so concurrent spawns from different isolates (which share /tmp) never
+  // collide.
+  const dir = `/tmp/.spawn-${pid}`;
   mkdirSync(dir, { recursive: true });
   const probePath = `${dir}/probe.mjs`;
   writeFileSync(
     probePath,
-    probeSource(entry, childArgv, options.cwd, options.env, dir)
+    probeSource(entry, childArgv, options.cwd, options.env, dir, pid, ppid)
   );
 
   // waitpid bracket: while the child runs, the SPAWNER must not be considered quiescent by its
@@ -844,7 +894,17 @@ export function spawn(
   const child = new ChildProcess();
   child.spawnfile = command;
   child.spawnargs = [command, ...argsArr];
-  child.pid = ++spawnCounter;
+  // Globally-unique, monotonic pid from the C++ bus (pid 1 is the root DO). ppid is this spawner's
+  // own pid. Emit the `spawn` lifecycle event now (synchronous, non-blocking append) so the event
+  // stream records the spawn with its pid/ppid/argv even for a child that exits immediately.
+  child.pid = childProcessUtil.nextPid();
+  child.ppid = myPid();
+  emitLifecycle({
+    type: 'spawn',
+    pid: child.pid,
+    ppid: child.ppid,
+    argv: child.spawnargs,
+  });
 
   const io = makeStdioChannels(normalized.stdio);
   // Node semantics: child.std{out,err} are Readables only in 'pipe' mode (null under
@@ -875,6 +935,37 @@ export function spawnSync(
   throw new ERR_METHOD_NOT_IMPLEMENTED('child_process.spawnSync');
 }
 
+// FORK-ONLY (native-spawn observability, gap #2): one native-spawn lifecycle event.
+export interface ProcessLifecycleEvent {
+  type: 'spawn' | 'exit';
+  pid: number | undefined;
+  ppid?: number; // spawn only
+  argv?: string[]; // spawn only
+  code?: number | null; // exit only
+}
+
+// FORK-ONLY (native-spawn observability, gap #2): read the process-global spawn lifecycle event
+// stream. Returns the events (spawn/exit, in order) appended at or after `cursor`, plus the next
+// cursor to pass on the following call. This is an append-only STREAM, not a live snapshot table:
+// exited processes remain in it, so a consumer reconstructs BOTH a live pstree (a `spawn` with no
+// matching `exit`) and an exited-history view. A consumer scopes to its own subtree by following
+// ppid links from its own pid (the root DO's pid is 1).
+export function readProcessEvents(cursor: number = 0): {
+  events: ProcessLifecycleEvent[];
+  cursor: number;
+} {
+  const raw = childProcessUtil.readLifecycleEvents(cursor);
+  const events: ProcessLifecycleEvent[] = [];
+  for (const s of raw) {
+    try {
+      events.push(JSON.parse(s) as ProcessLifecycleEvent);
+    } catch {
+      // skip a malformed record
+    }
+  }
+  return { events, cursor: cursor + raw.length };
+}
+
 export default {
   ChildProcess,
   _forkChild,
@@ -885,4 +976,5 @@ export default {
   fork,
   spawn,
   spawnSync,
+  readProcessEvents,
 };

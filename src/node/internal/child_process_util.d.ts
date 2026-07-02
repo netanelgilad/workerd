@@ -42,6 +42,14 @@ export interface ChildProcessUtil {
   // drainProcess must not declare quiescence. Balance every spawnBegin with a spawnEnd.
   spawnBegin(): void;
   spawnEnd(): void;
+  // FORK-ONLY (native-spawn observability, gap #2): process-global spawn lifecycle bus.
+  // nextPid() returns a monotonic, stable pid (pid 1 is the root DO, so children start at 2).
+  // emitLifecycleEvent() appends a JSON spawn/exit event; readLifecycleEvents(cursor) returns the
+  // events appended at or after `cursor` (an append-only event stream, so exited processes stay
+  // observable). The caller advances its cursor by the returned array's length.
+  nextPid(): number;
+  emitLifecycleEvent(json: string): void;
+  readLifecycleEvents(cursor: number): string[];
 }
 
 declare const util: ChildProcessUtil;

@@ -1,0 +1,25 @@
+using Workerd = import "/workerd/workerd.capnp";
+
+const unitTests :Workerd.Config = (
+  services = [
+    ( name = "child_process-spawn-observability-test",
+      worker = (
+        modules = [
+          (name = "worker", esModule = embed "child_process-spawn-observability-test.js")
+        ],
+        compatibilityFlags = [
+          "nodejs_compat",
+          "nodejs_compat_v2",
+          "experimental",
+          "enable_nodejs_fs_module",
+          "enable_nodejs_child_process_module",
+        ],
+        # A workerLoader binding grants this worker native-spawn capability: child_process.spawn()
+        # launches sub-isolate "processes" over the shared /tmp VFS.
+        bindings = [
+          (name = "loader", workerLoader = ()),
+        ],
+      )
+    ),
+  ],
+);

@@ -557,6 +557,8 @@ export const testDefaultExport = {
     ok('fork' in defaultExport);
     ok('spawn' in defaultExport);
     ok('spawnSync' in defaultExport);
+    // FORK-ONLY (native-spawn observability, gap #2): the lifecycle event-stream reader.
+    ok('readProcessEvents' in defaultExport);
 
     const expectedKeys = [
       'ChildProcess',
@@ -569,6 +571,7 @@ export const testDefaultExport = {
       'fork',
       'spawn',
       'spawnSync',
+      'readProcessEvents',
     ];
     deepStrictEqual(Object.keys(defaultExport).sort(), expectedKeys.sort());
   },

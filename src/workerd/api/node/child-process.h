@@ -32,10 +32,32 @@ class ChildProcessUtil final: public jsg::Object {
   void spawnBegin(jsg::Lock& js);
   void spawnEnd(jsg::Lock& js);
 
+  // FORK-ONLY (native-spawn observability, gap #2): process-global spawn lifecycle bus.
+  //
+  // A native-spawn "process" has no OS pid, so the runtime hands out its own. nextPid() returns a
+  // process-global, monotonic, stable pid; pid 1 is reserved for the root Durable Object (workerd's
+  // default process.pid), so the first spawned child is pid 2. A child learns its own pid via
+  // process.pid (the probe injects it) and stamps that as its children's ppid -- so ppid chains
+  // reconstruct the full pstree.
+  //
+  // Lifecycle events (spawn/exit, carrying pid + ppid + argv/code) are appended to one
+  // process-global, append-only log as they happen. A consumer (the root DO / iso) reads it
+  // incrementally via a cursor -- an EVENT STREAM, not a live snapshot table: exited processes stay
+  // in the log, so both a live pstree and an exited-history view are reconstructible. Emitting an
+  // event is a synchronous, non-blocking append: it never keeps a process alive or blocks
+  // drainProcess quiescence. The log is process-global (all isolates share it); a consumer scopes
+  // to its own subtree by following ppid links from its root pid.
+  uint nextPid(jsg::Lock& js);
+  void emitLifecycleEvent(jsg::Lock& js, kj::String json);
+  kj::Array<kj::String> readLifecycleEvents(jsg::Lock& js, uint cursor);
+
   JSG_RESOURCE_TYPE(ChildProcessUtil) {
     JSG_METHOD(getSpawnLoader);
     JSG_METHOD(spawnBegin);
     JSG_METHOD(spawnEnd);
+    JSG_METHOD(nextPid);
+    JSG_METHOD(emitLifecycleEvent);
+    JSG_METHOD(readLifecycleEvents);
   }
 };
 
