@@ -448,7 +448,13 @@ kj::Promise<void> IoContext::runToQuiescence() {
         // To avoid declaring quiescence during the brief window between dispatching an awaitIo and
         // its timer/continuation showing up, we require a short streak of consecutive idle-looking
         // passes (no moreWork, no one-shot timer, no new tasks) before resolving.
-        bool idleLooking = !moreWork && getNonRepeatingTimeoutCount() == 0 && !newIo;
+        //
+        // FORK-ONLY (native-spawn): additionally, a spawned sub-isolate "process" still running
+        // (pendingSpawnCount > 0) blocks quiescence -- a parent with live children hasn't exited
+        // (waitpid semantics). The child's drain RPC await is otherwise invisible here: while in
+        // flight it registers no new tasks and no one-shot timers.
+        bool idleLooking = !moreWork && getNonRepeatingTimeoutCount() == 0 && !newIo &&
+            getPendingSpawnCount() == 0;
         if (idleLooking) {
           if (++st.idleStreak >= DrainState::REQUIRED_IDLE_STREAK) {
             return kj::READY_NOW;

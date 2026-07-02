@@ -848,6 +848,23 @@ class IoContext final: public kj::Refcounted, private kj::TaskSet::ErrorHandler 
     return drainProcess;
   }
 
+  // FORK-ONLY (native-spawn): waitpid semantics for runToQuiescence(). While a
+  // node:child_process.spawn() sub-isolate launched from this context is still running (its
+  // drain RPC is outstanding), this context must not be considered quiescent -- a process with
+  // live children hasn't exited. The RPC await itself is invisible to the drain heuristic (it
+  // registers no new tasks and no one-shot timers while in flight), so child_process brackets
+  // each spawn with these calls (see ChildProcessUtil::spawnBegin/spawnEnd).
+  void incrementPendingSpawns() {
+    ++pendingSpawnCount;
+  }
+  void decrementPendingSpawns() {
+    KJ_ASSERT(pendingSpawnCount > 0, "unbalanced decrementPendingSpawns()");
+    --pendingSpawnCount;
+  }
+  uint getPendingSpawnCount() const {
+    return pendingSpawnCount;
+  }
+
   // Returns a promise that resolves once `now() >= when`.
   kj::Promise<void> atTime(kj::Date when) {
     return getIoChannelFactory().getTimer().atTime(when);
@@ -1119,6 +1136,11 @@ class IoContext final: public kj::Refcounted, private kj::TaskSet::ErrorHandler 
   // loaded with WorkerCode.drainProcess, so its RPC entrypoint should drain the JS event loop to
   // quiescence (runToQuiescence) before resolving. See setDrainProcess()/shouldDrainProcess().
   bool drainProcess = false;
+
+  // FORK-ONLY (native-spawn): number of node:child_process.spawn() sub-isolate "processes"
+  // launched from this context that have not yet exited. Non-zero blocks quiescence in
+  // runToQuiescence(). See incrementPendingSpawns()/decrementPendingSpawns().
+  uint pendingSpawnCount = 0;
 
   kj::Own<const Worker> worker;
   kj::Maybe<Worker::Actor&> actor;

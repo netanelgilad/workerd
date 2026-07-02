@@ -135,6 +135,15 @@ class WorkerLoader: public jsg::Object {
     // Defaults to false (upstream behavior: the entrypoint promise resolves immediately).
     jsg::Optional<bool> drainProcess = false;
 
+    // FORK-ONLY (native-spawn): OPT-IN. When true, this dynamically-loaded worker is granted an
+    // implicit worker-loader channel of its own, making node:child_process.spawn() functional
+    // inside it: spawn(file, args) launches ANOTHER drainProcess sub-isolate over the shared /tmp
+    // and the ChildProcess 'exit' event fires when that sub-isolate reaches event-loop quiescence.
+    // Spawned children are themselves created with allowSpawn, so "processes" can spawn
+    // "processes" recursively with no userland plumbing. Defaults to false (upstream behavior:
+    // child_process.spawn throws "not implemented").
+    jsg::Optional<bool> allowSpawn = false;
+
     // TODO(someday): cache API outbound?
 
     JSG_STRUCT(compatibilityDate,
@@ -149,7 +158,8 @@ class WorkerLoader: public jsg::Object {
         streamingTails,
         shareParentTmp,
         vfsModuleFallback,
-        drainProcess);
+        drainProcess,
+        allowSpawn);
   };
 
   jsg::Ref<WorkerStub> get(

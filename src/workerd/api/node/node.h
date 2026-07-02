@@ -6,6 +6,7 @@
 
 #include <workerd/api/node/async-hooks.h>
 #include <workerd/api/node/buffer.h>
+#include <workerd/api/node/child-process.h>
 #include <workerd/api/node/module.h>
 #include <workerd/api/node/process.h>
 #include <workerd/api/node/sqlite.h>
@@ -36,7 +37,8 @@ namespace workerd::api::node {
   V(ZlibUtil, "node-internal:zlib")                                                                \
   V(UrlUtil, "node-internal:url")                                                                  \
   V(TimersUtil, "node-internal:timers")                                                            \
-  V(SqliteUtil, "node-internal:sqlite")
+  V(SqliteUtil, "node-internal:sqlite")                                                            \
+  V(ChildProcessUtil, "node-internal:child_process_util")
 
 // Add to the NODEJS_MODULES_EXPERIMENTAL list any currently in-development
 // node.js compat C++ modules that should be guarded by the experimental compat
@@ -338,4 +340,4 @@ kj::Own<jsg::modules::ModuleBundle> getExternalNodeJsCompatModuleBundle(auto fea
       EW_NODE_DIAGNOSTICCHANNEL_ISOLATE_TYPES, EW_NODE_ASYNCHOOKS_ISOLATE_TYPES,                   \
       EW_NODE_UTIL_ISOLATE_TYPES, EW_NODE_PROCESS_ISOLATE_TYPES, EW_NODE_ZLIB_ISOLATE_TYPES,       \
       EW_NODE_URL_ISOLATE_TYPES, EW_NODE_MODULE_ISOLATE_TYPES, EW_NODE_TIMERS_ISOLATE_TYPES,       \
-      EW_NODE_SQLITE_ISOLATE_TYPES
+      EW_NODE_SQLITE_ISOLATE_TYPES, EW_NODE_CHILD_PROCESS_ISOLATE_TYPES

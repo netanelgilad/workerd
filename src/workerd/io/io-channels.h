@@ -375,6 +375,16 @@ class IoChannelFactory {
     JSG_FAIL_REQUIRE(Error, "Dynamic worker loading is not supported by this runtime.");
   }
 
+  // FORK-ONLY (native-spawn): the worker-loader channel node:child_process.spawn() should use to
+  // launch sub-isolate "processes" from this worker, or kj::none if this worker has no spawn
+  // capability. A worker gets a spawn channel either by having a workerLoader binding in its
+  // config (channel 0) or by being dynamically loaded with `allowSpawn: true` (which appends an
+  // implicit loader channel). This is the internal path that lets ANY isolate launched as a
+  // "process" spawn another sub-isolate, recursively, without a JS-visible binding.
+  virtual kj::Maybe<uint> getSpawnLoaderChannel() {
+    return kj::none;
+  }
+
   // Get the network for connecting to workerd debug ports.
   // This is used by the workerdDebugPort binding to connect to remote workerd instances.
   virtual kj::Network& getWorkerdDebugPortNetwork() {
@@ -511,6 +521,12 @@ struct DynamicWorkerSource {
   // (e.g. npm-cli.js) to completion. See WorkerCode.drainProcess.
   bool drainProcess = false;
 
+  // FORK-ONLY (native-spawn): when true, the loaded worker is granted an implicit worker-loader
+  // channel of its own so that node:child_process.spawn() works inside it (spawn = load a
+  // drainProcess sub-isolate over the shared /tmp). See WorkerCode.allowSpawn and
+  // IoChannelFactory::getSpawnLoaderChannel().
+  bool allowSpawn = false;
+
   // Owns any data structures pointed into by the other members. (E.g. `source` contains a lot of
   // `StringPtr`s; `ownContent` owns the backing buffer for them.)
   kj::Own<void> ownContent;
@@ -542,6 +558,8 @@ struct DynamicWorkerSource {
       .vfsModuleFallback = vfsModuleFallback,
       // FORK-ONLY (drain-process): carry the opt-in through re-loads of the isolate.
       .drainProcess = drainProcess,
+      // FORK-ONLY (native-spawn): carry the opt-in through re-loads of the isolate.
+      .allowSpawn = allowSpawn,
       .ownContent = kj::mv(newOwnContent),
       .ownContentIsRpcResponse = ownContentIsRpcResponse,
     };

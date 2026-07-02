@@ -3124,7 +3124,10 @@ class Server::WorkerService final: public Service,
       kj::Maybe<kj::Rc<workerd::Directory>> sharedTmpDir = kj::none,
       // FORK-ONLY (drain-process): when true, each request's IoContext is marked so its RPC
       // entrypoint drains the JS event loop to quiescence before resolving.
-      bool drainProcess = false)
+      bool drainProcess = false,
+      // FORK-ONLY (native-spawn): worker-loader channel index that node:child_process.spawn()
+      // uses to launch sub-isolate processes, or kj::none if this worker cannot spawn.
+      kj::Maybe<uint> spawnLoaderChannel = kj::none)
       : channelTokenHandler(channelTokenHandler),
         serviceName(serviceName),
         threadContext(threadContext),
@@ -3142,7 +3145,8 @@ class Server::WorkerService final: public Service,
         isDynamic(isDynamic),
         abortIsolateCallback(kj::mv(abortIsolateCallback)),
         sharedTmpDir(kj::mv(sharedTmpDir)),
-        drainProcess(drainProcess) {}
+        drainProcess(drainProcess),
+        spawnLoaderChannel(spawnLoaderChannel) {}
 
   // Call immediately after the constructor to set up `actorNamespaces`. This can't happen during
   // the constructor itself since it sets up cyclic references, which will throw an exception if
@@ -3682,6 +3686,10 @@ class Server::WorkerService final: public Service,
   // marked so its RPC entrypoint drains the JS event loop to quiescence before resolving.
   bool drainProcess = false;
 
+  // FORK-ONLY (native-spawn): worker-loader channel index used by node:child_process.spawn(), or
+  // kj::none if this worker has no spawn capability. Exposed via getSpawnLoaderChannel().
+  kj::Maybe<uint> spawnLoaderChannel;
+
   // ---------------------------------------------------------------------------
   // implements kj::TaskSet::ErrorHandler
 
@@ -3925,6 +3933,12 @@ class Server::WorkerService final: public Service,
   kj::Own<WorkerStubChannel> loadIsolate(uint loaderChannel,
       kj::Maybe<kj::String> name,
       kj::Function<kj::Promise<DynamicWorkerSource>()> fetchSource) override;
+
+  // FORK-ONLY (native-spawn): expose the spawn loader channel (if any) so node:child_process can
+  // mint sub-isolate "processes" from this worker via the internal WorkerLoader path.
+  kj::Maybe<uint> getSpawnLoaderChannel() override {
+    return spawnLoaderChannel;
+  }
 
   kj::Network& getWorkerdDebugPortNetwork() override {
     auto& channels =
@@ -4550,6 +4564,12 @@ struct Server::WorkerDef {
   // request's IoContext. See DynamicWorkerSource.drainProcess.
   bool drainProcess = false;
 
+  // FORK-ONLY (native-spawn): index into `workerLoaderChannels` of the channel that
+  // node:child_process.spawn() should use to launch sub-isolate "processes" from this worker, or
+  // kj::none if this worker has no spawn capability. Stored on the WorkerService and exposed via
+  // IoChannelFactory::getSpawnLoaderChannel(). See DynamicWorkerSource.allowSpawn.
+  kj::Maybe<uint> spawnLoaderChannel;
+
   // Callback invoked when abortIsolate() is called. Used by dynamic workers to remove
   // themselves from the loader's isolate map.
   kj::Maybe<kj::Function<void()>> abortIsolateCallback;
@@ -4762,6 +4782,21 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
         }
       });
 
+      // FORK-ONLY (native-spawn): if the caller opted in via `allowSpawn`, grant this dynamic
+      // worker one implicit worker-loader channel of its own (channel 0 -- dynamic workers have
+      // no config-declared loader bindings). node:child_process.spawn() reaches it through
+      // IoChannelFactory::getSpawnLoaderChannel(), letting the loaded "process" launch further
+      // sub-isolate processes recursively without any JS-visible binding.
+      kj::Vector<FutureWorkerLoaderChannel> workerLoaderChannels;
+      kj::Maybe<uint> spawnLoaderChannel;
+      if (source.allowSpawn) {
+        spawnLoaderChannel = workerLoaderChannels.size();
+        workerLoaderChannels.add(FutureWorkerLoaderChannel{
+          .name = kj::str("spawn"),
+          .id = kj::none,
+        });
+      }
+
       WorkerDef def{
         .featureFlags = source.compatibilityFlags,
         .source = kj::mv(source.source),
@@ -4779,6 +4814,8 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
         .subrequestChannels = kj::mv(subrequestChannels),
         .actorClassChannels = kj::mv(actorClassChannels),
         .rpcChannels = kj::mv(rpcChannels),
+        // FORK-ONLY (native-spawn): the implicit loader channel built above (empty otherwise).
+        .workerLoaderChannels = kj::mv(workerLoaderChannels),
 
         .tails = KJ_MAP(tail, source.tails) -> FutureSubrequestChannel {
           return {
@@ -4833,6 +4870,9 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
         // FORK-ONLY (drain-process): carry the opt-in into the WorkerService so each child request's
         // IoContext is marked to drain to quiescence at the RPC entrypoint.
         .drainProcess = source.drainProcess,
+        // FORK-ONLY (native-spawn): carry the implicit spawn channel index (if opted in) into the
+        // WorkerService so node:child_process.spawn() can find it.
+        .spawnLoaderChannel = spawnLoaderChannel,
         // The callback is owned by the WorkerService, which is owned by `this`, so a raw
         // pointer is safe.
         .abortIsolateCallback = kj::Function<void()>([this]() { onAbortIsolate(); }),
@@ -5053,6 +5093,12 @@ kj::Promise<kj::Own<Server::Service>> Server::makeWorker(kj::StringPtr name,
     }
   }
 
+  // FORK-ONLY (native-spawn): a config-defined worker that holds at least one workerLoader
+  // binding can also spawn sub-isolate "processes" via node:child_process.spawn(); spawn uses
+  // its first loader channel. Computed before `workerLoaderChannels` is moved into the def.
+  kj::Maybe<uint> spawnLoaderChannel;
+  if (workerLoaderChannels.size() > 0) spawnLoaderChannel = uint(0);
+
   // Construct `WorkerDef` from `conf`.
   WorkerDef def{
     .featureFlags = featureFlags.asReader(),
@@ -5101,6 +5147,9 @@ kj::Promise<kj::Own<Server::Service>> Server::makeWorker(kj::StringPtr name,
         jsg::Lock& lock, const Worker::Api& api, v8::Local<v8::Object> target) {
       return WorkerdApi::from(api).compileGlobals(lock, globals, target, 1);
     },
+
+    // FORK-ONLY (native-spawn): see above.
+    .spawnLoaderChannel = spawnLoaderChannel,
     // clang-format on
   };
 
@@ -5404,6 +5453,9 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
   // moved into `linkCallback`, so we can forward it to the WorkerService below.
   bool drainProcess = def.drainProcess;
 
+  // FORK-ONLY (native-spawn): same hoist -- read the spawn channel out of `def` before the move.
+  kj::Maybe<uint> spawnLoaderChannel = def.spawnLoaderChannel;
+
   auto linkCallback = [this, def = kj::mv(def), totalActorChannels](WorkerService& workerService,
                           Worker::ValidationErrorReporter& errorReporter) mutable {
     WorkerService::LinkedIoChannels result;
@@ -5568,7 +5620,9 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
           // the hoisted local (not def.sharedTmpDir, which was moved-from into linkCallback above).
           kj::mv(sharedTmpDir),
           // FORK-ONLY (drain-process): forward the opt-in to the service (hoisted local).
-          drainProcess);
+          drainProcess,
+          // FORK-ONLY (native-spawn): forward the spawn channel to the service (hoisted local).
+          spawnLoaderChannel);
   result->initActorNamespaces(def.localActorConfigs, actorNamespacesByUniqueKey, network);
   co_return result;
 }

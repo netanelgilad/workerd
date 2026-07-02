@@ -228,6 +228,9 @@ DynamicWorkerSource WorkerLoader::toDynamicWorkerSource(jsg::Lock& js,
     // FORK-ONLY (drain-process): forward the opt-in so the child's RPC entrypoint drains the JS
     // event loop to quiescence before resolving. See WorkerCode.drainProcess.
     .drainProcess = code.drainProcess.orDefault(false),
+    // FORK-ONLY (native-spawn): forward the opt-in so the child gets its own implicit
+    // worker-loader channel for node:child_process.spawn(). See WorkerCode.allowSpawn.
+    .allowSpawn = code.allowSpawn.orDefault(false),
     .ownContent = ownCompatFlags.attach(kj::mv(code.modules), kj::mv(code.mainModule)),
     .ownContentIsRpcResponse = false};
 }

@@ -19,6 +19,7 @@ wd_cc_library(
     name = "node",
     srcs = [
         "async-hooks.c++",
+        "child-process.c++",
         "crypto.c++",
         "crypto-keys.c++",
         "diagnostics-channel.c++",
@@ -30,6 +31,7 @@ wd_cc_library(
     ],
     hdrs = [
         "async-hooks.h",
+        "child-process.h",
         "crypto.h",
         "diagnostics-channel.h",
         "module.h",
@@ -48,6 +50,7 @@ wd_cc_library(
         "//src/node",
         "//src/rust/api",
         "//src/workerd/api:streams-compression",
+        "//src/workerd/api:worker-loader",
         "//src/workerd/io",
         "//src/workerd/util:mimetype",
         "@capnp-cpp//src/kj/compat:kj-brotli",
