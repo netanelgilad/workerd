@@ -701,11 +701,15 @@ class IoContext final: public kj::Refcounted, private kj::TaskSet::ErrorHandler 
   // throws "Disallowed operation called within global scope").
   //
   // Each pass re-enters the context via run() and pumps both the microtask queue and V8's message
-  // loop with the context bound. Between passes it yields to the KJ event loop -- racing
-  // waitUntilTasks.onEmpty() against a short timer -- so awaited I/O continuations and timers
-  // (npm's setTimeouts register as wait-until tasks for actors) can make progress before the next
-  // pump. It resolves when V8 reports no remaining message-loop work AND there are no outstanding
-  // wait-until tasks. Bounded by the limit enforcer's drain budget and cancelled on abort.
+  // loop with the context bound. Between passes it yields to the KJ event loop so awaited I/O
+  // continuations and timers can make progress before the next pump. It resolves exactly when,
+  // after a full pump: V8 reports no remaining message-loop work, no one-shot timers are pending
+  // (repeating setInterval timers are deliberately excluded -- a deviation from node, where a
+  // ref'd interval pins the process; see getNonRepeatingTimeoutCount for the rationale),
+  // no JS-awaited I/O is in flight (pendingDrainIoCount, maintained by awaitIoImpl -- this is the
+  // analog of Node's "active requests" refcount and covers fetch/socket/stream/fs awaits and
+  // outgoing RPC awaits), and no spawned child "process" is still running (pendingSpawnCount).
+  // Bounded by the limit enforcer's drain budget and cancelled on abort.
   //
   // This is intended to be chained after a `drainProcess`-loaded dynamic worker's RPC entrypoint
   // promise resolves, so `await stub.run()` resolves only when the child's event loop is idle --
@@ -851,9 +855,10 @@ class IoContext final: public kj::Refcounted, private kj::TaskSet::ErrorHandler 
   // FORK-ONLY (native-spawn): waitpid semantics for runToQuiescence(). While a
   // node:child_process.spawn() sub-isolate launched from this context is still running (its
   // drain RPC is outstanding), this context must not be considered quiescent -- a process with
-  // live children hasn't exited. The RPC await itself is invisible to the drain heuristic (it
-  // registers no new tasks and no one-shot timers while in flight), so child_process brackets
-  // each spawn with these calls (see ChildProcessUtil::spawnBegin/spawnEnd).
+  // live children hasn't exited. The in-flight RPC await is nowadays also visible to the drain
+  // loop via pendingDrainIoCount (JS RPC calls route through awaitIo), but child_process still
+  // brackets each spawn with these calls (see ChildProcessUtil::spawnBegin/spawnEnd) so that
+  // waitpid semantics don't depend on the RPC plumbing's await shape.
   void incrementPendingSpawns() {
     ++pendingSpawnCount;
   }
@@ -864,6 +869,23 @@ class IoContext final: public kj::Refcounted, private kj::TaskSet::ErrorHandler 
   uint getPendingSpawnCount() const {
     return pendingSpawnCount;
   }
+
+  // FORK-ONLY (drain-process): number of awaitIoImpl() operations currently in flight in this
+  // context -- i.e. KJ promises that JavaScript is (or may be) waiting on: fetch responses,
+  // socket/stream reads and writes, fs operations, outgoing RPC calls. This is the analog of
+  // Node's "active requests" refcount: runToQuiescence() must not declare the "process" exited
+  // while it is non-zero. Maintained only when shouldDrainProcess() is true (see
+  // registerPendingDrainIo()); always zero otherwise.
+  uint getPendingDrainIoCount() const {
+    return pendingDrainIoCount;
+  }
+
+  // FORK-ONLY (drain-process): returns a guard that increments pendingDrainIoCount for its
+  // lifetime, or an empty Own when this is not a drainProcess context. awaitIoImpl() attaches
+  // this to the *outermost* task promise so the count stays non-zero through the completion
+  // run() that resolves the JS promise -- there is no window where the I/O has finished but its
+  // JS-visible resolution is still queued.
+  kj::Own<void> registerPendingDrainIo();
 
   // Returns a promise that resolves once `now() >= when`.
   kj::Promise<void> atTime(kj::Date when) {
@@ -1142,6 +1164,13 @@ class IoContext final: public kj::Refcounted, private kj::TaskSet::ErrorHandler 
   // runToQuiescence(). See incrementPendingSpawns()/decrementPendingSpawns().
   uint pendingSpawnCount = 0;
 
+  // FORK-ONLY (drain-process): live count of in-flight awaitIoImpl() operations (Node's "active
+  // requests" analog). See getPendingDrainIoCount()/registerPendingDrainIo(). Maintained only
+  // when drainProcess is true. NOTE: must be declared before `tasks` -- the counting guards are
+  // attached to task promises, so they are destroyed during `tasks`' destruction and must find
+  // this counter still alive.
+  uint pendingDrainIoCount = 0;
+
   kj::Own<const Worker> worker;
   kj::Maybe<Worker::Actor&> actor;
   kj::Own<LimitEnforcer> limitEnforcer;
@@ -1171,9 +1200,6 @@ class IoContext final: public kj::Refcounted, private kj::TaskSet::ErrorHandler 
   kj::ForkedPromise<void> abortPromise = nullptr;
 
   class PendingEvent;
-
-  // FORK-ONLY (drain-process): per-call state for runToQuiescence(). Defined in io-context.c++.
-  struct DrainState;
 
   kj::Maybe<PendingEvent&> pendingEvent;
   kj::Maybe<kj::Promise<void>> abortFromHangTask;
@@ -1527,7 +1553,7 @@ jsg::PromiseForResult<Func, T, true> IoContext::awaitIoImpl(
   // it's important in that case that `promiseExceptionOrT` will be destroyed before `func`.
   auto [jsPromise, resolver] = js.newPromiseAndResolver<ExceptionOr<Result>>();
 
-  addTask(promiseExceptionOrT.then(
+  auto ioTask = promiseExceptionOrT.then(
       [this, resolver = kj::mv(resolver), ilOrCs = kj::mv(ilOrCs),
           maybeAsyncContext = jsg::AsyncContextFrame::currentRef(js),
           // Reminder: It's important that `func` gets attached to the promise before the whole
@@ -1609,7 +1635,16 @@ jsg::PromiseForResult<Func, T, true> IoContext::awaitIoImpl(
       }
     },
         kj::mv(ilOrCs));
-  }));
+  });
+
+  // FORK-ONLY (drain-process): count this pending I/O so runToQuiescence() has exact "in-flight
+  // I/O" accounting (Node's active-requests analog). The guard is attached to the *outermost*
+  // task promise, so the count stays non-zero through the completion run() above (which resolves
+  // the JS promise); it is also released if the task is canceled on context teardown.
+  if (drainProcess) {
+    ioTask = ioTask.attach(registerPendingDrainIo());
+  }
+  addTask(kj::mv(ioTask));
 
   // Reminder: This can throw JsExceptionThrown if the execution context has been terminated. We
   // have already disowned `promise` and `func` by this point, though, so teardown order is no
