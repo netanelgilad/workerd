@@ -266,53 +266,12 @@ function writeToParent(which: 'stdout' | 'stderr', chunk: Uint8Array): void {
 }
 
 // ---------------------------------------------------------------------------
-// Command resolution over the shared /tmp VFS (node semantics, ported from the proven
-// isolate-spawn bridge): tokenize `sh -c` lines, resolve bins via PATH and node_modules/.bin,
-// special-case `node`.
-
-function tokenize(line: string): string[] {
-  const out: string[] = [];
-  let cur = '';
-  let q: string | null = null;
-  let has = false;
-  for (let i = 0; i < line.length; i++) {
-    const ch = line.charAt(i);
-    if (q) {
-      if (ch === q) q = null;
-      else if (q === '"' && ch === '\\' && i + 1 < line.length)
-        cur += line.charAt(++i);
-      else cur += ch;
-    } else if (ch === "'" || ch === '"') {
-      q = ch;
-      has = true;
-    } else if (ch === '\\' && i + 1 < line.length) {
-      cur += line.charAt(++i);
-      has = true;
-    } else if (ch === ' ' || ch === '\t' || ch === '\n') {
-      if (has || cur) {
-        out.push(cur);
-        cur = '';
-        has = false;
-      }
-    } else {
-      cur += ch;
-      has = true;
-    }
-  }
-  if (has || cur) out.push(cur);
-  return out;
-}
-
-function resolveArgv(file: string, args: string[]): string[] {
-  const base = file.split('/').pop();
-  if (
-    (base === 'sh' || base === 'bash' || base === 'zsh') &&
-    args[0] === '-c'
-  ) {
-    return tokenize(args[1] ?? '');
-  }
-  return [file, ...args];
-}
+// Command resolution over the shared /tmp VFS (node semantics): execvp-style PATH resolution of
+// the program name to a JS entry, resolving bins via PATH and node_modules/.bin, special-casing
+// `node`. Shell mode is NOT handled here -- a shell is an ordinary program, so `sh -c '<line>'`
+// (and `shell:true`, which synthesizes it) resolves the real `sh` binary via PATH like any other
+// program and hands it the line UNMODIFIED; the runtime never tokenizes/interprets shell syntax
+// itself. See runSpawn for where shell mode is turned into `sh -c <line>`.
 
 function realOrSelf(p: string): string {
   try {
@@ -652,14 +611,21 @@ async function runSpawn(
     );
   }
 
-  // Resolve the command line to a JS entry on the VFS.
-  let argv = [command, ...args];
+  // Resolve the command line to a JS entry on the VFS. Shell mode delegates to a REAL `sh`
+  // resolved via PATH: the runtime never tokenizes or interprets the line -- a shell is an
+  // ordinary program, not a runtime feature. `shell:true` synthesizes `sh -c <line>` exactly like
+  // Node's POSIX path (joining command + args with spaces); `options.shell` as a string names the
+  // shell binary (still PATH-resolved). An EXPLICIT `sh -c '<line>'` needs no special-casing here
+  // -- it flows through unchanged so the child's `sh` binary parses the line and PATH-resolves the
+  // inner commands (recursively spawning them). If no `sh` is on PATH, resolution below fails
+  // ENOENT-style (exit 127), exactly like a real OS; there is deliberately no builtin fallback.
+  let argv: string[];
   if (options.shell) {
-    // `shell: true` semantics: the command line is a shell line; we support simple
-    // whitespace/quote splitting (no operators, no expansions).
-    argv = tokenize([command, ...args].join(' '));
+    const shellName = typeof options.shell === 'string' ? options.shell : 'sh';
+    argv = [shellName, '-c', [command, ...args].join(' ')];
+  } else {
+    argv = [command, ...args];
   }
-  argv = resolveArgv(argv[0] ?? '', argv.slice(1));
 
   const file = argv[0] ?? '';
   const base = file.split('/').pop();

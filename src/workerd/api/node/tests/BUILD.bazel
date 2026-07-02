@@ -41,6 +41,12 @@ wd_test(
 )
 
 wd_test(
+    src = "child_process-spawn-shell-test.wd-test",
+    args = ["--experimental"],
+    data = ["child_process-spawn-shell-test.js"],
+)
+
+wd_test(
     src = "console-nodejs-test.wd-test",
     args = ["--experimental"],
     data = ["console-nodejs-test.js"],
